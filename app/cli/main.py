@@ -26,6 +26,7 @@ from app.database.repository import (  # noqa: E402
     list_projects,
 )
 from app.logging_utils import append_jsonl_event  # noqa: E402
+from app.report_builder import write_report  # noqa: E402
 from app.models import Project, Task  # noqa: E402
 from app.models.enums import LogStatus  # noqa: E402
 from app.models.test_result import TestResultStatus  # noqa: E402
@@ -395,6 +396,25 @@ def cmd_task_test(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    """engine report <task_id> : rapport HTML statique local, généré
+    uniquement à partir de données déjà en SQLite. Aucun serveur, aucun
+    port ouvert — un simple fichier écrit sur disque."""
+    conn = _connect()
+    task = get_task(conn, args.task_id)
+    if task is None:
+        conn.close()
+        print(f"[FAILED] tâche introuvable: {args.task_id}")
+        return 1
+
+    reports_dir = REPO_ROOT / "reports"
+    output_path = write_report(conn, task, _logs_dir(), reports_dir)
+    conn.close()
+
+    print(f"[VERIFIED] rapport généré: {output_path}")
+    return 0
+
+
 def cmd_sync_push(args: argparse.Namespace) -> int:
     """Push explicite vers origin. C'est la SEULE fonction de ce module qui
     appelle push_to_origin() — aucune autre commande (task create, task
@@ -497,6 +517,12 @@ def build_parser() -> argparse.ArgumentParser:
     task_test = task_sub.add_parser("test", help="exécute pytest réellement dans le projet lié à la tâche")
     task_test.add_argument("task_id")
     task_test.set_defaults(func=cmd_task_test)
+
+    report_parser = subparsers.add_parser(
+        "report", help="génère reports/<task_id>.html (statique, données déjà en SQLite)"
+    )
+    report_parser.add_argument("task_id")
+    report_parser.set_defaults(func=cmd_report)
 
     sync_parser = subparsers.add_parser("sync", help="synchronisation avec le remote (push explicite uniquement)")
     sync_sub = sync_parser.add_subparsers(dest="sync_command", required=True)
