@@ -20,9 +20,11 @@ from app.database.repository import (  # noqa: E402
 from app.logging_utils import append_jsonl_event  # noqa: E402
 from app.models import Project, Task  # noqa: E402
 from app.models.enums import LogStatus  # noqa: E402
+from app.git_wrapper import get_current_branch, push_to_origin  # noqa: E402
 from app.state_machine import TaskState  # noqa: E402
 from app.state_machine.service import TaskNotFoundError, transition_task  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
+from scripts.verify_security import run_all_checks as run_all_security_checks  # noqa: E402
 
 
 def _config_path() -> Path:
@@ -79,7 +81,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     for r in results:
         print(f"[{r.status}] {r.name}: {r.detail}")
 
-    failed = [r for r in results if r.status == "FAILED"]
+    security_results = []
+    if getattr(args, "security", False):
+        security_results = run_all_security_checks()
+        print()
+        print("--- vérification de sécurité (hooks) ---")
+        for r in security_results:
+            print(f"[{r.status}] {r.name}: {r.detail}")
+
+    failed = [r for r in results if r.status == "FAILED"] + [r for r in security_results if r.status == "FAILED"]
 
     append_jsonl_event(
         _logs_dir(),
@@ -87,7 +97,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         event="engine doctor exécuté",
         level="INFO",
         status=LogStatus.VERIFIED.value,
-        details={"results": [r.__dict__ for r in results]},
+        details={
+            "results": [r.__dict__ for r in results],
+            "security_results": [r.__dict__ for r in security_results],
+        },
     )
 
     return 1 if failed else 0
@@ -199,13 +212,69 @@ def cmd_task_status(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_sync_push(args: argparse.Namespace) -> int:
+    """Push explicite vers origin. C'est la SEULE fonction de ce module qui
+    appelle push_to_origin() — aucune autre commande (task create, task
+    status, project add, etc.) n'y fait référence, directement ou
+    indirectement. Un push reste toujours un acte volontaire de
+    l'utilisateur, jamais un sous-effet d'une autre commande."""
+    security_results = run_all_security_checks()
+    failed = [r for r in security_results if r.status == "FAILED"]
+
+    if failed:
+        print("[BLOCKED] push refusé : la vérification de sécurité des hooks a échoué.")
+        for r in failed:
+            print(f"  [FAILED] {r.name}: {r.detail}")
+
+        if not args.force_unsafe:
+            print("Relancez avec --force-unsafe pour outrepasser (confirmation explicite requise).")
+            return 1
+
+        print("--force-unsafe demandé malgré l'échec ci-dessus.")
+        confirmation = input("Tapez exactement OUI pour confirmer le push malgré cet échec: ")
+        if confirmation.strip() != "OUI":
+            print("[BLOCKED] confirmation non reçue telle quelle, push annulé.")
+            return 1
+        print("[CLAIMED] push forcé malgré un échec de vérification sécurité, confirmé explicitement.")
+
+    branch = get_current_branch(REPO_ROOT)
+    result = push_to_origin(REPO_ROOT, branch)
+
+    append_jsonl_event(
+        _logs_dir(),
+        component="cli.sync_push",
+        event="engine sync push exécuté",
+        level="INFO" if result.ok else "ERROR",
+        status=LogStatus.VERIFIED.value if result.ok else LogStatus.FAILED.value,
+        details={
+            "branch": branch,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "security_checks_failed": len(failed),
+            "force_unsafe": args.force_unsafe,
+        },
+    )
+
+    if not result.ok:
+        print(f"[FAILED] git push a échoué (code {result.returncode}): {result.stderr}")
+        return 1
+
+    print(f"[VERIFIED] push vers origin/{branch} réussi.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="engine", description="HERBERT V0.1 - LOCAL CORE")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init", help="crée structure, migrations, config par défaut").set_defaults(func=cmd_init)
 
-    subparsers.add_parser("doctor", help="vérifie réellement l'environnement").set_defaults(func=cmd_doctor)
+    doctor_parser = subparsers.add_parser("doctor", help="vérifie réellement l'environnement")
+    doctor_parser.add_argument(
+        "--security", action="store_true", default=False, help="inclut la vérification de sécurité des hooks"
+    )
+    doctor_parser.set_defaults(func=cmd_doctor)
 
     project_parser = subparsers.add_parser("project", help="gestion des projets")
     project_sub = project_parser.add_subparsers(dest="project_command", required=True)
@@ -231,6 +300,20 @@ def build_parser() -> argparse.ArgumentParser:
     task_status.add_argument("--to", required=False, default=None, help="nouvel état souhaité (optionnel)")
     task_status.add_argument("--reason", required=False, default=None)
     task_status.set_defaults(func=cmd_task_status)
+
+    sync_parser = subparsers.add_parser("sync", help="synchronisation avec le remote (push explicite uniquement)")
+    sync_sub = sync_parser.add_subparsers(dest="sync_command", required=True)
+
+    sync_push = sync_sub.add_parser(
+        "push", help="push explicite vers origin — jamais appelé implicitement par une autre commande"
+    )
+    sync_push.add_argument(
+        "--force-unsafe",
+        action="store_true",
+        default=False,
+        help="outrepasse un échec de vérification sécurité (une confirmation explicite reste requise)",
+    )
+    sync_push.set_defaults(func=cmd_sync_push)
 
     return parser
 

@@ -71,3 +71,12 @@ def get_head_commit(repo_path: str | Path) -> str:
     if not result.ok:
         raise GitWrapperError(f"impossible de lire HEAD: {result.stderr}")
     return result.stdout
+
+
+def push_to_origin(repo_path: str | Path, branch: str | None = None) -> GitResult:
+    """Push explicite vers origin/<branch>. N'est appelé nulle part ailleurs
+    dans HERBERT que par la commande CLI `engine sync push` — jamais en
+    sous-effet d'une autre opération (commit, task create, etc.)."""
+    if branch is None:
+        branch = get_current_branch(repo_path)
+    return _run_git(repo_path, ["push", "origin", branch])
