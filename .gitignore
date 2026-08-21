@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/*.jsonl
+data/
+*.db
+*.sqlite3
+.env
+secrets/
+.venv/
+venv/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

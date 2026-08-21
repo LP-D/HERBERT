@@ -1,0 +1,11 @@
+# Configuration HERBERT V0.1 — clé: valeur, un seul niveau d'imbrication.
+# Parsé par app/config.py (parseur minimal stdlib, pas de dépendance PyYAML).
+
+database:
+  path: data/herbert.db
+
+migrations:
+  dir: migrations
+
+logs:
+  dir: logs
