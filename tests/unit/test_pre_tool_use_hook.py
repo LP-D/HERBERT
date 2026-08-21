@@ -145,3 +145,69 @@ def test_pre_tool_use_logs_before_deciding_even_on_deny(pre_tool_use_module, iso
     count = conn.execute("SELECT COUNT(*) AS c FROM commands").fetchone()["c"]
     conn.close()
     assert count == 1
+
+
+def test_pre_tool_use_blocks_path_traversal_on_write(pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch):
+    """V0.2 : PathPolicy câblée dans le hook pour Write/Edit, via `cwd`."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    project_root = tmp_path / "some_project"
+    project_root.mkdir()
+
+    event = {
+        "tool_name": "Write",
+        "cwd": str(project_root),
+        "tool_input": {"file_path": "../../etc/passwd", "content": "x"},
+    }
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 2
+    assert "PathPolicy" in message
+
+
+def test_pre_tool_use_allows_valid_path_write(pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch):
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    project_root = tmp_path / "some_project"
+    project_root.mkdir()
+
+    event = {
+        "tool_name": "Write",
+        "cwd": str(project_root),
+        "tool_input": {"file_path": "src/main.py", "content": "x"},
+    }
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 0, message
+
+
+def test_pre_tool_use_blocks_reserved_windows_name_write(pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch):
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    project_root = tmp_path / "some_project"
+    project_root.mkdir()
+
+    event = {
+        "tool_name": "Edit",
+        "cwd": str(project_root),
+        "tool_input": {"file_path": "logs/COM1.txt", "content": "x"},
+    }
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 2
+    assert "PathPolicy" in message
+
+
+def test_pre_tool_use_blocks_edit_tool_writing_settings_json_directly(
+    pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch
+):
+    """Faux sentiment de sécurité potentiel : étendre le matcher à Write|Edit
+    pour PathPolicy ne doit pas laisser un Edit direct sur settings.json
+    passer à travers (seul le texte des commandes Bash était vérifié avant)."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    project_root = tmp_path / "some_project"
+    project_root.mkdir()
+    (project_root / ".claude").mkdir()
+
+    event = {
+        "tool_name": "Edit",
+        "cwd": str(project_root),
+        "tool_input": {"file_path": str(project_root / ".claude" / "settings.json"), "content": "{}"},
+    }
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 2
+    assert "permission" in message.lower()

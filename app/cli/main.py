@@ -6,21 +6,38 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from app.change_proof_builder import build_change_proof, detect_regressions  # noqa: E402
 from app.cli.doctor import run_all_checks  # noqa: E402
 from app.config import load_config, write_default_config  # noqa: E402
 from app.database.connection import get_connection  # noqa: E402
 from app.database.migrate import apply_migrations, current_schema_version  # noqa: E402
 from app.database.repository import (  # noqa: E402
+    get_latest_audit_log_details,
+    get_latest_change_proof,
+    get_latest_verified_pass_test_result_for_project,
+    get_project,
     get_project_by_name,
     get_task,
+    insert_audit_log,
+    insert_change_proof,
     insert_project,
     insert_task,
+    insert_test_result,
     list_projects,
 )
 from app.logging_utils import append_jsonl_event  # noqa: E402
 from app.models import Project, Task  # noqa: E402
 from app.models.enums import LogStatus  # noqa: E402
-from app.git_wrapper import get_current_branch, push_to_origin  # noqa: E402
+from app.models.test_result import TestResultStatus  # noqa: E402
+from app.git_wrapper import (  # noqa: E402
+    GitWrapperError,
+    create_candidate_branch,
+    get_current_branch,
+    get_head_commit,
+    push_to_origin,
+    rollback_to_commit,
+)
+from app.pytest_runner import run_pytest_for_project  # noqa: E402
 from app.state_machine import TaskState  # noqa: E402
 from app.state_machine.service import TaskNotFoundError, transition_task  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
@@ -178,11 +195,23 @@ def cmd_task_status(args: argparse.Namespace) -> int:
 
     if args.to is None:
         task = get_task(conn, args.id)
-        conn.close()
         if task is None:
+            conn.close()
             print(f"[FAILED] tâche introuvable: {args.id}")
             return 1
         print(f"[VERIFIED] tâche {task.id}: status={task.status.value}")
+
+        proof = get_latest_change_proof(conn, task.id)
+        conn.close()
+        if proof is None:
+            print("[VERIFIED] aucun ChangeProof enregistré pour cette tâche (lancez `engine task test`)")
+        else:
+            print(
+                f"[VERIFIED] dernier ChangeProof: status={proof.status.value} "
+                f"tests_passed={proof.tests_passed} tests_failed={proof.tests_failed} "
+                f"fichiers_modifiés={len(proof.files_changed)} "
+                f"régressions={proof.regressions or 'aucune'} ({proof.created_at.isoformat()})"
+            )
         return 0
 
     try:
@@ -210,6 +239,160 @@ def cmd_task_status(args: argparse.Namespace) -> int:
         f"{transition.from_state.value} -> {transition.to_state.value} (illégale)"
     )
     return 1
+
+
+def _get_task_and_project(conn: sqlite3.Connection, task_id: str) -> tuple[Task | None, Project | None, str | None]:
+    """Retourne (task, project, message_erreur). message_erreur est None si
+    tout s'est bien passé."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return None, None, f"tâche introuvable: {task_id}"
+    project = get_project(conn, task.project_id)
+    if project is None:
+        return task, None, f"projet introuvable pour cette tâche (project_id={task.project_id})"
+    return task, project, None
+
+
+def cmd_task_branch(args: argparse.Namespace) -> int:
+    conn = _connect()
+    task, project, error = _get_task_and_project(conn, args.task_id)
+    if error:
+        conn.close()
+        print(f"[FAILED] {error}")
+        return 1
+
+    try:
+        base_commit = get_head_commit(project.path)
+    except GitWrapperError as exc:
+        conn.close()
+        print(f"[FAILED] impossible de lire HEAD dans {project.path}: {exc}")
+        return 1
+
+    branch_name = f"candidate/{task.id}"
+    result = create_candidate_branch(project.path, branch_name)
+
+    insert_audit_log(
+        conn,
+        component="cli.task_branch",
+        event="branche candidate créée" if result.ok else "échec création branche candidate",
+        level="INFO" if result.ok else "ERROR",
+        status=LogStatus.VERIFIED.value if result.ok else LogStatus.FAILED.value,
+        task_id=task.id,
+        details={
+            "branch": branch_name,
+            "base_commit": base_commit,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        },
+    )
+    conn.close()
+
+    if not result.ok:
+        print(f"[FAILED] création de la branche candidate: {result.stderr}")
+        return 1
+
+    print(f"[VERIFIED] branche candidate créée: {branch_name} (base={base_commit[:12]})")
+    return 0
+
+
+def cmd_task_rollback(args: argparse.Namespace) -> int:
+    conn = _connect()
+    task, project, error = _get_task_and_project(conn, args.task_id)
+    if error:
+        conn.close()
+        print(f"[FAILED] {error}")
+        return 1
+
+    branch_info = get_latest_audit_log_details(conn, task.id, "cli.task_branch")
+    if not branch_info or not branch_info.get("base_commit"):
+        conn.close()
+        print("[FAILED] aucune branche candidate connue pour cette tâche (lancez d'abord `engine task branch`)")
+        return 1
+
+    base_commit = branch_info["base_commit"]
+
+    print(f"[BLOCKED] rollback demandé: git reset --hard vers {base_commit[:12]} dans {project.path}")
+    print("Cette opération est IRRÉVERSIBLE et écrase tout changement non commité.")
+    confirmation = input("Tapez exactement OUI pour confirmer le rollback: ")
+    if confirmation.strip() != "OUI":
+        conn.close()
+        print("[BLOCKED] confirmation non reçue telle quelle, rollback annulé.")
+        return 1
+
+    result = rollback_to_commit(project.path, base_commit)
+
+    insert_audit_log(
+        conn,
+        component="cli.task_rollback",
+        event="rollback exécuté" if result.ok else "échec du rollback",
+        level="INFO" if result.ok else "ERROR",
+        status=LogStatus.VERIFIED.value if result.ok else LogStatus.FAILED.value,
+        task_id=task.id,
+        details={"base_commit": base_commit, "stdout": result.stdout, "stderr": result.stderr},
+    )
+    conn.close()
+
+    if not result.ok:
+        print(f"[FAILED] rollback: {result.stderr}")
+        return 1
+
+    print(f"[VERIFIED] rollback effectué vers {base_commit[:12]}")
+    return 0
+
+
+def cmd_task_test(args: argparse.Namespace) -> int:
+    conn = _connect()
+    task, project, error = _get_task_and_project(conn, args.task_id)
+    if error:
+        conn.close()
+        print(f"[FAILED] {error}")
+        return 1
+
+    previous_pass = get_latest_verified_pass_test_result_for_project(conn, project.id)
+
+    result = run_pytest_for_project(project.path, task.id)
+    insert_test_result(conn, result)
+
+    regressions = detect_regressions(previous_pass, result)
+
+    branch_info = get_latest_audit_log_details(conn, task.id, "cli.task_branch")
+    base_commit = branch_info.get("base_commit") if branch_info else None
+
+    proof = build_change_proof(conn, task, project, result, base_commit, regressions=regressions)
+    insert_change_proof(conn, proof)
+
+    append_jsonl_event(
+        _logs_dir(),
+        component="cli.task_test",
+        event="engine task test exécuté",
+        level="INFO" if result.status == TestResultStatus.VERIFIED_PASS else "WARNING",
+        status=result.status.value,
+        task_id=task.id,
+        details={
+            "project_path": project.path,
+            "total": result.total,
+            "passed": result.passed,
+            "failed": result.failed,
+            "errors": result.errors,
+            "duration_seconds": result.duration_seconds,
+            "regressions": regressions,
+        },
+    )
+    conn.close()
+
+    print(
+        f"[{result.status.value}] pytest dans {project.path}: total={result.total} "
+        f"passed={result.passed} failed={result.failed} errors={result.errors} "
+        f"durée={result.duration_seconds:.2f}s"
+    )
+    if regressions:
+        print(f"[FAILED] régression(s) détectée(s) par rapport au dernier run VERIFIED_PASS: {', '.join(regressions)}")
+
+    if result.status in (TestResultStatus.VERIFIED_FAIL, TestResultStatus.NOT_EXECUTED, TestResultStatus.UNAVAILABLE):
+        return 1
+    if regressions:
+        return 1
+    return 0
 
 
 def cmd_sync_push(args: argparse.Namespace) -> int:
@@ -300,6 +483,20 @@ def build_parser() -> argparse.ArgumentParser:
     task_status.add_argument("--to", required=False, default=None, help="nouvel état souhaité (optionnel)")
     task_status.add_argument("--reason", required=False, default=None)
     task_status.set_defaults(func=cmd_task_status)
+
+    task_branch = task_sub.add_parser("branch", help="crée/checkout candidate/<task_id> dans le projet lié")
+    task_branch.add_argument("task_id")
+    task_branch.set_defaults(func=cmd_task_branch)
+
+    task_rollback = task_sub.add_parser(
+        "rollback", help="reset --hard vers le commit stable précédent (confirmation explicite requise)"
+    )
+    task_rollback.add_argument("task_id")
+    task_rollback.set_defaults(func=cmd_task_rollback)
+
+    task_test = task_sub.add_parser("test", help="exécute pytest réellement dans le projet lié à la tâche")
+    task_test.add_argument("task_id")
+    task_test.set_defaults(func=cmd_task_test)
 
     sync_parser = subparsers.add_parser("sync", help="synchronisation avec le remote (push explicite uniquement)")
     sync_sub = sync_parser.add_subparsers(dest="sync_command", required=True)

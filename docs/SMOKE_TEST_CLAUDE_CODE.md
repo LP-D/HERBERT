@@ -125,6 +125,43 @@ commande s'exécute directement) — à re-vérifier à chaque fois plutôt que
 supposé acquis, surtout si le mode de permission de la session a changé
 (`bypassPermissions` vs autre).
 
+### 7 (obligatoire depuis V0.2) — écriture directe sur settings.json via l'outil Edit
+
+Depuis que le matcher `PreToolUse` couvre aussi `Write|Edit` (V0.2, pour
+PathPolicy), il faut vérifier séparément que la protection anti-auto-
+modification de `.claude/settings.json` fonctionne aussi pour un appel
+**Edit natif** de Claude Code, pas seulement pour une commande Bash
+(`echo >> settings.json`) — ce sont deux chemins de code différents dans
+le hook (`_targets_settings_json_for_write` pour Bash, un check dédié
+`tool_name in ("Write", "Edit")` pour Edit/Write direct).
+
+1. Hash SHA-256 avant :
+   ```bash
+   python -c "import hashlib; print(hashlib.sha256(open('.claude/settings.json','rb').read()).hexdigest())"
+   ```
+2. Utiliser l'outil **Edit** (pas Bash) pour tenter une modification
+   réelle du fichier — n'importe quel changement de contenu, ex. ajouter
+   une entrée factice à la liste `ask`.
+3. Observer le résultat :
+   - **Bloqué (attendu)** : message `PreToolUse:Edit hook error: ...
+     [herbert] commande bloquée: modification des règles de permission
+     HERBERT elles-mêmes` affiché directement dans la session, l'édition
+     n'est jamais appliquée.
+   - **Pas bloqué (échec réel du bugfix)** : le fichier est modifié. Ne
+     PAS committer HERBERT tant que ce n'est pas corrigé.
+4. Hash SHA-256 après — doit être **identique** à l'étape 1. Ne pas se
+   contenter de l'absence d'erreur visible comme preuve.
+5. Vérifier la trace : `commands` (SQLite) doit contenir une ligne avec
+   `command` = chemin du fichier (pas de texte Bash, puisque c'est un
+   appel Edit) et `decision = DENY` ; `logs/*.jsonl` doit avoir
+   l'équivalent avec `file_path` renseigné et `path_policy.allowed: true`
+   (PathPolicy autorise le chemin lui-même — c'est la protection
+   anti-auto-modification dédiée qui bloque, pas PathPolicy).
+
+Résultat réel constaté à la mise au point de V0.2 : bloqué comme prévu,
+hash identique avant/après, trace SQLite+JSONL présente et concordante
+(écart de ~15ms entre les deux écritures).
+
 ## Ce que ce test ne remplace pas
 
 `scripts/verify_security.py` / `tests/unit/test_security_consolidated.py`

@@ -13,5 +13,6 @@ class ChangeProof(BaseModel):
     commands_executed: list[str] = Field(default_factory=list)
     tests_passed: int = 0
     tests_failed: int = 0
+    regressions: list[str] = Field(default_factory=list)
     status: TaskState
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

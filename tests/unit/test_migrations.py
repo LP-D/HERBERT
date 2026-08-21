@@ -10,13 +10,14 @@ EXPECTED_TABLES = {
     "commands",
     "change_proofs",
     "audit_log",
+    "test_results",
 }
 
 
 def test_migration_applies_without_error(tmp_path):
     conn = get_connection(tmp_path / "migration_test.db")
     applied = apply_migrations(conn, MIGRATIONS_DIR)
-    assert applied == [1]
+    assert applied == [1, 2, 3]
     conn.close()
 
 
@@ -27,14 +28,14 @@ def test_schema_has_expected_tables(db_conn):
 
 
 def test_schema_version_tracked(db_conn):
-    assert current_schema_version(db_conn) == 1
+    assert current_schema_version(db_conn) == 3
 
 
 def test_migration_is_idempotent(tmp_path):
     conn = get_connection(tmp_path / "idempotent_test.db")
     first = apply_migrations(conn, MIGRATIONS_DIR)
     second = apply_migrations(conn, MIGRATIONS_DIR)
-    assert first == [1]
+    assert first == [1, 2, 3]
     assert second == []
     conn.close()
 

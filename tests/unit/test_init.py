@@ -31,12 +31,14 @@ def test_engine_init_creates_structure_and_applies_migrations(isolated_repo_root
     assert db_path.exists(), "engine init doit réellement créer la base SQLite via les migrations"
 
     conn = get_connection(db_path)
-    assert current_schema_version(conn) == 1
+    assert current_schema_version(conn) == 3
     tables = {
         row["name"]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
-    assert {"projects", "tasks", "state_transitions", "commands", "change_proofs", "audit_log"}.issubset(tables)
+    assert {
+        "projects", "tasks", "state_transitions", "commands", "change_proofs", "audit_log", "test_results",
+    }.issubset(tables)
     conn.close()
 
 

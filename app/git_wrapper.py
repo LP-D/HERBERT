@@ -73,6 +73,16 @@ def get_head_commit(repo_path: str | Path) -> str:
     return result.stdout
 
 
+def diff_files_since(repo_path: str | Path, base_commit: str) -> list[str]:
+    """Fichiers modifiés entre `base_commit` et HEAD (candidate branch).
+    Équivalent structuré de `git diff --stat` : on veut une liste de
+    chemins pour ChangeProof.files_changed, pas du texte à re-parser."""
+    result = _run_git(repo_path, ["diff", "--name-only", base_commit, "HEAD"])
+    if not result.ok:
+        raise GitWrapperError(f"impossible de calculer le diff depuis {base_commit}: {result.stderr}")
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
 def push_to_origin(repo_path: str | Path, branch: str | None = None) -> GitResult:
     """Push explicite vers origin/<branch>. N'est appelé nulle part ailleurs
     dans HERBERT que par la commande CLI `engine sync push` — jamais en
