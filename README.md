@@ -78,6 +78,111 @@ pour ce protocole manuel, à refaire après toute modification de
 pytest tests/
 ```
 
+## Déploiement sur un projet cible
+
+HERBERT protège d'autres projets que lui-même : un projet cible (par
+exemple `C:\Users\<user>\mon-autre-projet`) est enregistré dans HERBERT
+et surveillé par ses hooks, sans jamais contenir de copie du code
+HERBERT.
+
+- **`.claude/settings.json` séparé par projet.** Le projet cible a son
+  propre `.claude/settings.json`, indépendant de celui de `herbert/`
+  (ce fichier-ci, à la racine de ce dépôt).
+- **Hooks en chemin ABSOLU vers les scripts HERBERT.** Contrairement au
+  `.claude/settings.json` de HERBERT lui-même (qui utilise
+  `$CLAUDE_PROJECT_DIR/.claude/hooks/...`, une variable résolue par
+  Claude Code vers la racine de la session en cours), le
+  `settings.json` d'un projet cible **ne peut pas** utiliser
+  `$CLAUDE_PROJECT_DIR` pour ses hooks : dans une session ouverte sur
+  le projet cible, cette variable pointe vers la racine du projet
+  cible, qui n'a pas de `.claude/hooks/pre_tool_use.py` à lui — le
+  code des hooks n'existe que dans `herbert/`. Le `command` de chaque
+  hook doit donc pointer en chemin absolu vers les scripts de CE dépôt
+  HERBERT (ex. `C:\Users\<user>\herbert\.claude\hooks\pre_tool_use.py`).
+  Les scripts eux-mêmes résolvent leur propre racine via
+  `Path(__file__).resolve().parents[2]` — donc la config, la base
+  SQLite (`data/herbert.db`) et les logs restent ceux de HERBERT,
+  partagés entre tous les projets cibles surveillés.
+- **Une session Claude Code = un projet.** N'ouvre jamais une session
+  à la racine de `herbert/` pour éditer un projet cible enregistré.
+  C'est le seul scénario où PathPolicy peut se tromper de racine —
+  voir la limite connue ci-dessous.
+- **Enregistrement préalable obligatoire.** Le projet cible doit être
+  ajouté avant tout usage via :
+  ```bash
+  python C:\Users\<user>\herbert\engine.py project add --name mon-projet --path C:\Users\<user>\mon-autre-projet
+  ```
+  Cette commande peut être lancée depuis n'importe quel répertoire
+  (elle résout toujours la racine HERBERT via `__file__`, jamais le
+  répertoire courant) ; c'est `--path` qui détermine sur quel dépôt
+  git les commandes `task branch` / `task test` / `task promote`
+  agiront ensuite pour ce projet.
+
+Exemple minimal de `settings.json` pour un projet cible (chemins
+génériques à adapter — voir [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
+pour le détail complet et une note de transparence sur cet exemple) :
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf:*)",
+      "Bash(Remove-Item -Recurse -Force:*)",
+      "Bash(ri -Recurse -Force:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(reg:*)",
+      "Bash(reg.exe:*)",
+      "Bash(sudo:*)",
+      "Bash(runas:*)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Edit(./.env)",
+      "Edit(./.env.*)",
+      "Edit(./secrets/**)",
+      "Write(./.env)",
+      "Write(./.env.*)",
+      "Write(./secrets/**)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(pip install:*)",
+      "Bash(npm install:*)",
+      "Bash(curl:*)",
+      "Bash(Invoke-WebRequest:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "python \"C:\\Users\\<user>\\herbert\\.claude\\hooks\\pre_tool_use.py\"" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "python \"C:\\Users\\<user>\\herbert\\.claude\\hooks\\post_tool_use.py\"" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Après création ou modification de ce fichier : redémarrer la session
+Claude Code du projet cible (pas seulement relancer une commande dans
+la session existante) et rejouer le protocole de
+[`docs/SMOKE_TEST_CLAUDE_CODE.md`](docs/SMOKE_TEST_CLAUDE_CODE.md) —
+ce document a été écrit pour le `settings.json` de HERBERT lui-même,
+mais le même risque (session déjà ouverte avant l'écriture du fichier,
+qui ne recharge pas la config) s'applique de la même façon à un
+`settings.json` de projet cible nouvellement créé.
+
 ## Limites connues (V0.1)
 
 - Le filtrage des commandes dangereuses est basé sur des patterns
@@ -85,3 +190,15 @@ pytest tests/
   formulée différemment peut contourner le filtre.
 - Pas de Docker, pas de sandbox, pas de scoring de risque — prévu pour
   des projets personnels de confiance, pas du code tiers non fiable.
+- **Aucun garde-fou de cohérence entre le `cwd` de la session et le
+  projet réellement visé.** PathPolicy résout la racine autorisée à
+  partir du `cwd` envoyé par Claude Code dans l'événement du hook
+  (voir `app/policy/path_policy.py` et `.claude/hooks/pre_tool_use.py`),
+  pas à partir d'une correspondance explicite avec un projet enregistré
+  dans la table `projects`. Si une session Claude Code est ouverte par
+  erreur à la racine de `herbert/` alors que l'utilisateur pense éditer
+  un autre projet enregistré, PathPolicy applique la racine de
+  `herbert/` — pas celle du projet visé — sans avertissement. Ce n'est
+  pas un bug à corriger : c'est une contrainte d'usage du modèle "une
+  session Claude Code = un projet" (voir "Déploiement sur un projet
+  cible" ci-dessus), à respecter, pas optionnelle.
