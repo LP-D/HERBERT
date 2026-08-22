@@ -162,6 +162,28 @@ Résultat réel constaté à la mise au point de V0.2 : bloqué comme prévu,
 hash identique avant/après, trace SQLite+JSONL présente et concordante
 (écart de ~15ms entre les deux écritures).
 
+### 7bis — faux positifs du détecteur anti-auto-modification (corrigés)
+
+Trois faux positifs réels ont été constatés sur `_targets_settings_json_for_write`
+(cause commune : correspondance textuelle sur toute la commande au lieu de
+résoudre la cible réelle de l'écriture) — corrigés en résolvant le chemin
+canonique réellement visé par rapport à `project_root`, voir
+`tests/unit/test_pre_tool_use_hook.py` pour les régressions :
+
+1. Lecture pure (`python -m json.tool .claude/settings.json`) — doit
+   rester autorisée.
+2. `"settings.json"` apparaissant dans le CONTENU écrit (heredoc) vers un
+   fichier settings.json d'un **autre** projet — doit être autorisé, ce
+   n'est pas une écriture du fichier protégé de CE projet.
+3. `2>&1` (duplication de descripteur de fichier stderr→stdout, pas une
+   écriture réelle) contenant un `>` littéral — ne doit jamais être
+   confondu avec une redirection fichier.
+
+Vérifié en session live le 2026-08-22 : les 3 scénarios passent en exit 0
+(autorisés), l'écriture réelle sur `.claude/settings.json` (via `>` Bash
+et via Edit direct) reste bloquée en exit 2 avec hash SHA-256 identique
+avant/après.
+
 ## Ce que ce test ne remplace pas
 
 `scripts/verify_security.py` / `tests/unit/test_security_consolidated.py`

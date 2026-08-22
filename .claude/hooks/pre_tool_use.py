@@ -38,35 +38,141 @@ from app.policy.path_policy import validate_path  # noqa: E402
 ADDITIONAL_DANGEROUS_PATTERNS: list[tuple[re.Pattern, str]] = generate_hook_patterns()
 
 # Cas spécial : .claude/settings.json ne doit être bloqué que pour une
-# ÉCRITURE (le lire, ex. `python -m json.tool .claude/settings.json`,
-# `cat .claude/settings.json`, doit rester autorisé — faux positif réel
-# constaté et corrigé, voir historique). Deuxième faux positif réel
-# constaté ensuite : un `>` littéral dans du texte ("->", diagnostics)
-# déclenchait le blocage même sans rapport avec settings.json, dès que
-# les deux apparaissaient n'importe où dans une commande multi-segments
-# (ex: `echo "... -> ..." && git diff .claude/settings.json`). Corrigé en
-# (a) excluant `->` du détecteur de redirection, et (b) exigeant que le
-# chemin ET l'indicateur d'écriture soient dans le MÊME segment de
-# commande (découpage sur les séparateurs shell &&, ||, ;, |). Cette
-# logique reste dédiée (pas une simple regex de POLICY) car aucune regex
-# unique testée n'a évité ces deux faux positifs sans ce découpage.
-SETTINGS_JSON_PATH_RE = re.compile(r"\.claude[\\/]settings\.json", re.IGNORECASE)
-WRITE_INDICATOR_RE = re.compile(
-    r"((?<!-)>{1,2}|Set-Content|Out-File|Add-Content|New-Item|\bcp\b|\bcopy\b|\bmv\b|\bmove\b|\bdel\b|\brm\b|Remove-Item|sed\s+-i)",
-    re.IGNORECASE,
-)
+# ÉCRITURE réellement dirigée vers CE fichier précis (chemin canonique
+# résolu par rapport à project_root), jamais sur une simple
+# correspondance textuelle "la commande contient un indicateur d'écriture
+# ET la chaîne settings.json quelque part". Trois faux positifs réels
+# constatés avec l'ancienne approche textuelle (voir tests_pre_tool_use_hook.py
+# pour les régressions correspondantes) :
+#   1. Lecture pure (`python -m json.tool .claude/settings.json`) —
+#      corrigé une première fois en exigeant un indicateur d'écriture,
+#      mais ça restait fragile face aux deux cas suivants.
+#   2. "settings.json" apparaissant dans le CONTENU écrit (heredoc) vers
+#      un AUTRE fichier settings.json (autre projet) — la cible réelle de
+#      l'écriture (le token qui suit l'opérateur de redirection) n'était
+#      jamais isolée du reste de la commande/du contenu.
+#   3. `2>&1` (duplication de descripteur de fichier, pas une écriture
+#      fichier) confondu avec une redirection `>` réelle simplement parce
+#      qu'il contient le caractère '>'.
+# La logique ci-dessous isole donc la CIBLE réelle de chaque opération
+# d'écriture repérée (redirection shell, ou commande à chemin explicite
+# type Set-Content/Remove-Item/cp/mv/sed -i), la résout en chemin
+# canonique par rapport à project_root, et ne bloque que si elle est
+# EXACTEMENT .claude/settings.json de CE projet.
 SHELL_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\|")
 
+# `>` / `>>` (avec préfixe optionnel de descripteur de fichier numérique,
+# ex. `2>`) — jamais précédé de `-` (exclut `->` dans du texte) — ou
+# `&>` / `&>>` (redirection combinée stdout+stderr vers un fichier réel).
+_REDIRECT_OP_RE = re.compile(r"(?<!-)(?:\d{0,2}>{1,2}|&>{1,2})")
+# `2>&1`, `>&2`, ... : duplication de descripteur vers un AUTRE descripteur,
+# jamais un fichier — ne doit jamais être traité comme une cible d'écriture.
+_FD_DUP_RE = re.compile(r"\s*&\d+\b")
+_TARGET_TOKEN_RE = re.compile(r"\s*([^\s&|;<>]+)")
 
-def _targets_settings_json_for_write(command: str) -> bool:
+_PATH_FLAG_RE = re.compile(r"^-(?:path|literalpath|filepath)$", re.IGNORECASE)
+# Commandes où le chemin cible est le DERNIER argument positionnel
+# (destination d'une copie/déplacement, ou fichier écrit par le cmdlet).
+_WRITE_DESTINATION_COMMANDS = {"set-content", "out-file", "add-content", "new-item", "cp", "copy", "mv", "move"}
+# Commandes où TOUS les arguments positionnels sont des cibles (suppression).
+_WRITE_DELETE_COMMANDS = {"remove-item", "ri", "rm", "del", "erase"}
+
+
+def _strip_quotes(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        return token[1:-1]
+    return token
+
+
+def _tokenize(segment: str) -> list[str]:
+    return re.findall(r"'[^']*'|\"[^\"]*\"|\S+", segment)
+
+
+def _extract_redirect_targets(segment: str) -> list[str]:
+    """Cible réelle de chaque `>`/`>>`/`&>`/`&>>` du segment — jamais une
+    duplication de descripteur (`2>&1`, `>&2`, ...), qui n'écrit dans aucun
+    fichier."""
+    targets = []
+    for match in _REDIRECT_OP_RE.finditer(segment):
+        op_text = match.group(0)
+        rest = segment[match.end():]
+        if not op_text.startswith("&"):
+            if _FD_DUP_RE.match(rest):
+                continue
+            rest = re.sub(r"^\s*&", "", rest)  # `N>&fichier` (bash) : flux combinés vers un vrai fichier
+        target_match = _TARGET_TOKEN_RE.match(rest)
+        if target_match:
+            targets.append(_strip_quotes(target_match.group(1)))
+    return targets
+
+
+def _command_basename(token: str) -> str:
+    name = _strip_quotes(token).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return name[:-4] if name.endswith(".exe") else name
+
+
+def _extract_command_write_targets(segment: str) -> list[str]:
+    """Cible réelle des commandes à chemin de fichier explicite
+    (Set-Content, Remove-Item, cp/mv, sed -i, ...) — jamais une
+    correspondance textuelle brute sur tout le segment."""
+    tokens = _tokenize(segment)
+    targets: list[str] = []
+    for idx, raw in enumerate(tokens):
+        cmd = _command_basename(raw)
+        is_sed_inplace = cmd == "sed" and any(_strip_quotes(t).startswith("-i") for t in tokens[idx + 1 : idx + 3])
+        if cmd not in _WRITE_DESTINATION_COMMANDS and cmd not in _WRITE_DELETE_COMMANDS and not is_sed_inplace:
+            continue
+
+        rest = tokens[idx + 1 :]
+        for pos, tok in enumerate(rest):
+            if _PATH_FLAG_RE.match(_strip_quotes(tok)) and pos + 1 < len(rest):
+                targets.append(_strip_quotes(rest[pos + 1]))
+
+        positional = [_strip_quotes(t) for t in rest if not t.startswith("-")]
+        if not positional:
+            continue
+        if cmd in _WRITE_DELETE_COMMANDS:
+            targets.extend(positional)
+        else:
+            targets.append(positional[-1])
+    return targets
+
+
+def _resolve(candidate: str, project_root: str) -> Path | None:
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+    try:
+        path = Path(candidate)
+        if not path.is_absolute():
+            path = Path(project_root) / path
+        return path.resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def _is_protected_settings_json(candidate: str, project_root: str) -> bool:
+    """Vrai seulement si `candidate`, résolu par rapport à project_root,
+    est EXACTEMENT .claude/settings.json DE CE PROJET — jamais un autre
+    fichier settings.json (autre projet, autre chemin), jamais une simple
+    correspondance de sous-chaîne."""
+    resolved = _resolve(candidate, project_root)
+    if resolved is None:
+        return False
+    protected = (Path(project_root) / ".claude" / "settings.json").resolve()
+    return resolved == protected
+
+
+def _targets_settings_json_for_write(command: str, project_root: str) -> bool:
     for segment in SHELL_SEGMENT_SPLIT_RE.split(command):
-        if SETTINGS_JSON_PATH_RE.search(segment) and WRITE_INDICATOR_RE.search(segment):
+        candidates = _extract_redirect_targets(segment) + _extract_command_write_targets(segment)
+        if any(_is_protected_settings_json(c, project_root) for c in candidates):
             return True
     return False
 
 
-def evaluate_command(command: str) -> tuple[CommandDecision, str]:
-    if _targets_settings_json_for_write(command):
+def evaluate_command(command: str, project_root: str) -> tuple[CommandDecision, str]:
+    if _targets_settings_json_for_write(command, project_root):
         return CommandDecision.DENY, "modification des règles de permission HERBERT elles-mêmes"
 
     for pattern, reason in ADDITIONAL_DANGEROUS_PATTERNS:
@@ -98,14 +204,19 @@ def handle_event(event: dict) -> tuple[int, str]:
     project_root = event.get("cwd") or str(REPO_ROOT)
     task_id = event.get("task_id")
 
-    decision, reason = evaluate_command(command) if command else (CommandDecision.ALLOW, "aucune commande Bash à évaluer")
+    decision, reason = (
+        evaluate_command(command, project_root) if command else (CommandDecision.ALLOW, "aucune commande Bash à évaluer")
+    )
 
     # Auto-protection de settings.json : un Edit/Write direct sur ce
     # fichier a le même effet qu'une écriture shell (`>>`, Set-Content...)
     # — même règle, sinon étendre le matcher à Write|Edit pour PathPolicy
     # créerait une fausse impression de protection sur ce point précis.
+    # Même résolution canonique que côté Bash (pas une correspondance de
+    # suffixe textuel) : un file_path absolu pointant vers le
+    # .claude/settings.json d'un AUTRE projet ne doit pas être bloqué ici.
     if file_path and tool_name in ("Write", "Edit") and decision != CommandDecision.DENY:
-        if file_path.replace("\\", "/").rstrip("/").endswith(".claude/settings.json"):
+        if _is_protected_settings_json(file_path, project_root):
             decision = CommandDecision.DENY
             reason = "modification des règles de permission HERBERT elles-mêmes"
 

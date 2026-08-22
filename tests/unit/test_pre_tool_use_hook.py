@@ -211,3 +211,127 @@ def test_pre_tool_use_blocks_edit_tool_writing_settings_json_directly(
     exit_code, message = pre_tool_use_module.handle_event(event)
     assert exit_code == 2
     assert "permission" in message.lower()
+
+
+# --- CORRECTIF : détecteur anti-auto-modification trop large (faux positifs
+# réels constatés — voir .claude/hooks/pre_tool_use.py, docstring de
+# _targets_settings_json_for_write pour le détail des 3 cas) ---
+
+
+def test_pre_tool_use_allows_fd_duplication_near_settings_json_read(
+    pre_tool_use_module, isolated_repo_root, monkeypatch
+):
+    """Faux positif réel #3 : `2>&1` duplique le descripteur stderr vers
+    stdout, ça n'écrit dans AUCUN fichier — ne doit jamais être confondu
+    avec une redirection `>` réelle simplement parce qu'il contient le
+    caractère '>', même quand settings.json est lu par la même commande."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+
+    event = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "python -m json.tool .claude/settings.json 2>&1"},
+    }
+
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 0, f"2>&1 ne doit jamais être traité comme une écriture: {message}"
+
+
+def test_pre_tool_use_allows_writing_other_project_settings_json_via_heredoc(
+    pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch
+):
+    """Faux positif réel #2 : écrire (via heredoc) le .claude/settings.json
+    d'un AUTRE projet, dont le contenu JSON contient littéralement
+    "Bash(rm -rf:*)" (un pattern deny normal généré par
+    generate_settings_permissions()), ne doit pas être bloqué — ce n'est ni
+    une écriture du fichier protégé de CE projet, ni un pattern dangereux
+    en soi."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    other_project = tmp_path / "other_project"
+    (other_project / ".claude").mkdir(parents=True)
+    other_settings = other_project / ".claude" / "settings.json"
+
+    command = (
+        f"cat > {other_settings} <<'EOF'\n"
+        "{\n"
+        '  "permissions": {\n'
+        '    "deny": ["Bash(rm -rf:*)"]\n'
+        "  }\n"
+        "}\n"
+        "EOF"
+    )
+    event = {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 0, f"écrire le settings.json d'un AUTRE projet ne doit pas être bloqué: {message}"
+
+
+def test_pre_tool_use_allows_settings_json_mentioned_in_content_written_elsewhere(
+    pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch
+):
+    """La chaîne "settings.json" apparaissant dans le CONTENU écrit vers un
+    fichier qui n'est PAS settings.json ne doit jamais déclencher le
+    blocage — seule la cible réelle de l'écriture compte."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    target = tmp_path / "notes.txt"
+
+    command = f'echo "voir .claude/settings.json pour les permissions" > {target}'
+    event = {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 0, message
+
+
+def test_pre_tool_use_blocks_powershell_style_write_to_settings_json(
+    pre_tool_use_module, isolated_repo_root, monkeypatch
+):
+    """Redesign : les commandes à chemin de fichier explicite (Set-Content,
+    Remove-Item, ...) doivent aussi être analysées par cible réelle (valeur
+    de -Path), pas seulement par présence du nom de la commande dans le
+    texte de la commande."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+
+    event = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "Set-Content -Path .claude/settings.json -Value '{}'"},
+    }
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 2, message
+
+
+def test_pre_tool_use_allows_powershell_style_write_to_other_file(
+    pre_tool_use_module, isolated_repo_root, monkeypatch
+):
+    """Même commande que ci-dessus mais ciblant un fichier différent : ne
+    doit pas être bloquée par la protection dédiée à settings.json."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+
+    event = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "Set-Content -Path other_settings.json -Value '{}'"},
+    }
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 0, message
+
+
+def test_pre_tool_use_allows_write_tool_to_other_settings_json_nested_elsewhere(
+    pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch
+):
+    """Même rigueur côté Write/Edit natif que côté Bash : un file_path
+    résolu vers un fichier settings.json DIFFÉRENT de
+    project_root/.claude/settings.json (ex. celui d'un sous-projet vendorisé)
+    ne doit pas être bloqué par cette protection dédiée, même s'il se
+    termine textuellement par ".claude/settings.json" (ancien bug : simple
+    correspondance de suffixe, pas de résolution canonique)."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    project_root = tmp_path / "some_project"
+    nested = project_root / "vendor" / "other-project" / ".claude"
+    nested.mkdir(parents=True)
+    other_settings = nested / "settings.json"
+
+    event = {
+        "tool_name": "Write",
+        "cwd": str(project_root),
+        "tool_input": {"file_path": str(other_settings), "content": "{}"},
+    }
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 0, f"écrire un settings.json différent ne doit pas être bloqué: {message}"
