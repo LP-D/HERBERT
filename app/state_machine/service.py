@@ -43,3 +43,38 @@ def transition_task(
         task = get_task(conn, task_id)
 
     return allowed, task, transition
+
+
+def advance_after_test_result(conn: sqlite3.Connection, task: Task, passed: bool) -> Task:
+    """Fait avancer l'état de la tâche vers TESTING puis DONE/FAILED selon
+    le résultat de `engine task test`, en empruntant le chemin légal depuis
+    l'état courant (V0.2 posait les tables de transition TESTING->DONE/FAILED
+    sans jamais les utiliser — comblé ici, nécessaire pour que `engine task
+    promote` (V0.3) ait un état DONE réel à vérifier).
+
+    Best-effort et non bloquant : si l'état courant ne permet pas ce chemin
+    (ex: la tâche est déjà PROMOTED, BLOCKED, ou HUMAN_REQUIRED), aucune
+    transition n'est forcée — la tentative refusée est quand même
+    journalisée par transition_task, jamais un échec silencieux."""
+    current = task.status
+
+    if current == TaskState.RECEIVED:
+        path = [TaskState.EXECUTING, TaskState.TESTING]
+    elif current == TaskState.EXECUTING:
+        path = [TaskState.TESTING]
+    elif current == TaskState.FAILED:
+        path = [TaskState.EXECUTING, TaskState.TESTING]
+    elif current == TaskState.TESTING:
+        path = []
+    else:
+        # DONE, PROMOTED, BLOCKED, HUMAN_REQUIRED : pas d'auto-avancement.
+        return task
+
+    for step in path:
+        allowed, task, _ = transition_task(conn, task.id, step)
+        if not allowed:
+            return task
+
+    target = TaskState.DONE if passed else TaskState.FAILED
+    _, task, _ = transition_task(conn, task.id, target)
+    return task

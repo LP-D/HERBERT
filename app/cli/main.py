@@ -14,6 +14,8 @@ from app.database.migrate import apply_migrations, current_schema_version  # noq
 from app.database.repository import (  # noqa: E402
     get_latest_audit_log_details,
     get_latest_change_proof,
+    get_latest_promotion_for_task,
+    get_latest_test_result_for_task,
     get_latest_verified_pass_test_result_for_project,
     get_project,
     get_project_by_name,
@@ -21,26 +23,32 @@ from app.database.repository import (  # noqa: E402
     insert_audit_log,
     insert_change_proof,
     insert_project,
+    insert_promotion,
     insert_task,
     insert_test_result,
     list_projects,
+    update_promotion_status,
 )
 from app.logging_utils import append_jsonl_event  # noqa: E402
 from app.report_builder import write_report  # noqa: E402
-from app.models import Project, Task  # noqa: E402
+from app.models import Project, Promotion, Task  # noqa: E402
 from app.models.enums import LogStatus  # noqa: E402
+from app.models.promotion import PromotionStatus  # noqa: E402
 from app.models.test_result import TestResultStatus  # noqa: E402
 from app.git_wrapper import (  # noqa: E402
     GitWrapperError,
+    checkout_branch,
     create_candidate_branch,
     get_current_branch,
     get_head_commit,
+    merge_branch,
     push_to_origin,
+    revert_commit,
     rollback_to_commit,
 )
 from app.pytest_runner import run_pytest_for_project  # noqa: E402
-from app.state_machine import TaskState  # noqa: E402
-from app.state_machine.service import TaskNotFoundError, transition_task  # noqa: E402
+from app.state_machine import TaskState, is_legal_transition  # noqa: E402
+from app.state_machine.service import TaskNotFoundError, advance_after_test_result, transition_task  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 from scripts.verify_security import run_all_checks as run_all_security_checks  # noqa: E402
 
@@ -203,7 +211,10 @@ def cmd_task_status(args: argparse.Namespace) -> int:
         print(f"[VERIFIED] tâche {task.id}: status={task.status.value}")
 
         proof = get_latest_change_proof(conn, task.id)
+        promotion = get_latest_promotion_for_task(conn, task.id)
+        health_check = get_latest_test_result_for_task(conn, task.id) if promotion else None
         conn.close()
+
         if proof is None:
             print("[VERIFIED] aucun ChangeProof enregistré pour cette tâche (lancez `engine task test`)")
         else:
@@ -213,6 +224,20 @@ def cmd_task_status(args: argparse.Namespace) -> int:
                 f"fichiers_modifiés={len(proof.files_changed)} "
                 f"régressions={proof.regressions or 'aucune'} ({proof.created_at.isoformat()})"
             )
+
+        if promotion is None:
+            print("[VERIFIED] aucune promotion enregistrée pour cette tâche")
+        else:
+            print(
+                f"[VERIFIED] dernière promotion: status={promotion.status.value} "
+                f"{promotion.commit_before[:12]} -> {promotion.commit_after[:12]} "
+                f"({promotion.stable_branch} <- {promotion.candidate_branch}) ({promotion.created_at.isoformat()})"
+            )
+            if health_check is not None:
+                print(
+                    f"[VERIFIED] health check post-promotion: status={health_check.status.value} "
+                    f"passed={health_check.passed} failed={health_check.failed} errors={health_check.errors}"
+                )
         return 0
 
     try:
@@ -263,10 +288,15 @@ def cmd_task_branch(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        # origin_branch = branche STABLE depuis laquelle la candidate est
+        # créée (ex: "master") — nécessaire pour `engine task promote`
+        # (V0.3), qui doit savoir dans quelle branche merger la candidate.
+        # Absent en V0.2 (seul base_commit, un hash, était enregistré).
+        origin_branch = get_current_branch(project.path)
         base_commit = get_head_commit(project.path)
     except GitWrapperError as exc:
         conn.close()
-        print(f"[FAILED] impossible de lire HEAD dans {project.path}: {exc}")
+        print(f"[FAILED] impossible de lire HEAD/branche courante dans {project.path}: {exc}")
         return 1
 
     branch_name = f"candidate/{task.id}"
@@ -281,6 +311,7 @@ def cmd_task_branch(args: argparse.Namespace) -> int:
         task_id=task.id,
         details={
             "branch": branch_name,
+            "origin_branch": origin_branch,
             "base_commit": base_commit,
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -351,16 +382,36 @@ def cmd_task_test(args: argparse.Namespace) -> int:
 
     previous_pass = get_latest_verified_pass_test_result_for_project(conn, project.id)
 
+    branch_info = get_latest_audit_log_details(conn, task.id, "cli.task_branch")
+    base_commit = branch_info.get("base_commit") if branch_info else None
+
+    # Bug réel trouvé pendant la démonstration bout-en-bout V0.3 : sans ce
+    # checkout, `engine task test` teste l'état ACTUEL du dépôt, pas
+    # forcément la branche candidate de CETTE tâche — invisible tant qu'on
+    # ne teste qu'une seule candidate à la fois (le cas de tous les tests
+    # unitaires V0.2), mais faux dès que deux candidates du même projet
+    # coexistent et qu'on bascule entre elles.
+    if branch_info and branch_info.get("branch"):
+        checkout_result = checkout_branch(project.path, branch_info["branch"])
+        if not checkout_result.ok:
+            conn.close()
+            print(f"[FAILED] impossible de checkout {branch_info['branch']}: {checkout_result.stderr}")
+            return 1
+
     result = run_pytest_for_project(project.path, task.id)
     insert_test_result(conn, result)
 
     regressions = detect_regressions(previous_pass, result)
 
-    branch_info = get_latest_audit_log_details(conn, task.id, "cli.task_branch")
-    base_commit = branch_info.get("base_commit") if branch_info else None
-
     proof = build_change_proof(conn, task, project, result, base_commit, regressions=regressions)
     insert_change_proof(conn, proof)
+
+    # Comble un manque réel de V0.2 : `engine task test` ne faisait jamais
+    # avancer l'état RÉEL de la tâche (elle restait bloquée à RECEIVED),
+    # alors que la table de transitions prévoyait déjà TESTING->DONE/FAILED
+    # sans jamais les emprunter. Nécessaire pour que `engine task promote`
+    # (V0.3) ait un état DONE réel à vérifier, pas seulement un ChangeProof.
+    advance_after_test_result(conn, task, passed=(result.status == TestResultStatus.VERIFIED_PASS))
 
     append_jsonl_event(
         _logs_dir(),
@@ -394,6 +445,219 @@ def cmd_task_test(args: argparse.Namespace) -> int:
     if regressions:
         return 1
     return 0
+
+
+def cmd_task_promote(args: argparse.Namespace) -> int:
+    """engine task promote <task_id> : merge réel de candidate/<task_id>
+    vers sa branche stable d'origine, puis health check post-merge. Un
+    health check en échec déclenche un AUTO_ROLLBACK (git revert du commit
+    de merge, jamais un reset --hard) — distinct d'un `engine task
+    rollback` manuel (V0.2) : composant de log différent
+    (cli.task_promote_auto_rollback vs cli.task_rollback), et status
+    AUTO_ROLLBACK dans la table promotions."""
+    conn = _connect()
+    task, project, error = _get_task_and_project(conn, args.task_id)
+    if error:
+        conn.close()
+        print(f"[FAILED] {error}")
+        return 1
+
+    proof = get_latest_change_proof(conn, task.id)
+    if proof is None:
+        conn.close()
+        print("[BLOCKED] promotion refusée: aucun ChangeProof pour cette tâche (lancez `engine task test` d'abord).")
+        return 1
+
+    if proof.status != TaskState.DONE or proof.regressions:
+        conn.close()
+        print(
+            f"[BLOCKED] promotion refusée: dernier ChangeProof status={proof.status.value}, "
+            f"tests_failed={proof.tests_failed}, régressions={proof.regressions or 'aucune'}."
+        )
+        return 1
+
+    if not is_legal_transition(task.status, TaskState.PROMOTED):
+        conn.close()
+        print(
+            f"[BLOCKED] promotion refusée: transition {task.status.value} -> PROMOTED illégale pour l'état "
+            f"actuel de la tâche (ChangeProof VERIFIED_PASS ne suffit pas si la tâche elle-même n'est pas DONE)."
+        )
+        return 1
+
+    branch_info = get_latest_audit_log_details(conn, task.id, "cli.task_branch")
+    if not branch_info or not branch_info.get("origin_branch"):
+        conn.close()
+        print("[FAILED] branche d'origine inconnue pour cette tâche (lancez d'abord `engine task branch`).")
+        return 1
+
+    stable_branch = branch_info["origin_branch"]
+    candidate_branch = branch_info["branch"]
+
+    checkout_result = checkout_branch(project.path, stable_branch)
+    if not checkout_result.ok:
+        conn.close()
+        print(f"[FAILED] impossible de checkout {stable_branch}: {checkout_result.stderr}")
+        return 1
+
+    try:
+        commit_before = get_head_commit(project.path)
+    except GitWrapperError as exc:
+        conn.close()
+        print(f"[FAILED] impossible de lire HEAD sur {stable_branch}: {exc}")
+        return 1
+
+    merge_result = merge_branch(
+        project.path,
+        candidate_branch,
+        message=f"Merge {candidate_branch} into {stable_branch} (HERBERT promotion, task {task.id})",
+    )
+
+    if not merge_result.ok:
+        insert_promotion(
+            conn,
+            Promotion(
+                task_id=task.id,
+                stable_branch=stable_branch,
+                candidate_branch=candidate_branch,
+                commit_before=commit_before,
+                commit_after=commit_before,
+                status=PromotionStatus.MERGE_FAILED,
+            ),
+        )
+        conn.close()
+        print(f"[FAILED] merge échoué: {merge_result.stderr}")
+        return 1
+
+    commit_after = get_head_commit(project.path)
+
+    promotion = Promotion(
+        task_id=task.id,
+        stable_branch=stable_branch,
+        candidate_branch=candidate_branch,
+        commit_before=commit_before,
+        commit_after=commit_after,
+        status=PromotionStatus.MERGED_PENDING_HEALTH_CHECK,
+    )
+    insert_promotion(conn, promotion)
+
+    transition_task(conn, task.id, TaskState.PROMOTED, reason="merge de promotion réussi")
+
+    promote_log_details = {
+        "stable_branch": stable_branch,
+        "candidate_branch": candidate_branch,
+        "commit_before": commit_before,
+        "commit_after": commit_after,
+    }
+    insert_audit_log(
+        conn,
+        component="cli.task_promote",
+        event="merge de promotion réussi, health check en cours",
+        level="INFO",
+        status=LogStatus.VERIFIED.value,
+        task_id=task.id,
+        details=promote_log_details,
+    )
+    append_jsonl_event(
+        _logs_dir(),
+        component="cli.task_promote",
+        event="merge de promotion réussi, health check en cours",
+        level="INFO",
+        status=LogStatus.VERIFIED.value,
+        task_id=task.id,
+        details=promote_log_details,
+    )
+    print(f"[VERIFIED] merge réussi: {candidate_branch} -> {stable_branch} ({commit_before[:12]} -> {commit_after[:12]})")
+
+    # --- Health check post-promotion : relance pytest sur la branche
+    # stable (déjà checkout ci-dessus), PAS la candidate. ---
+    health_result = run_pytest_for_project(project.path, task.id)
+    insert_test_result(conn, health_result)
+
+    if health_result.status == TestResultStatus.VERIFIED_PASS:
+        update_promotion_status(conn, promotion.id, PromotionStatus.HEALTH_CHECK_PASSED)
+        transition_task(conn, task.id, TaskState.DONE, reason="health check post-promotion réussi")
+
+        health_check_details = {"total": health_result.total, "passed": health_result.passed}
+        insert_audit_log(
+            conn,
+            component="cli.task_promote_health_check",
+            event="health check post-promotion réussi",
+            level="INFO",
+            status=LogStatus.VERIFIED.value,
+            task_id=task.id,
+            details=health_check_details,
+        )
+        append_jsonl_event(
+            _logs_dir(),
+            component="cli.task_promote_health_check",
+            event="health check post-promotion réussi",
+            level="INFO",
+            status=LogStatus.VERIFIED.value,
+            task_id=task.id,
+            details=health_check_details,
+        )
+        conn.close()
+        print(f"[VERIFIED] health check post-promotion réussi ({health_result.passed}/{health_result.total}) — tâche DONE.")
+        return 0
+
+    # --- Health check en échec : AUTO_ROLLBACK (revert, pas reset --hard) ---
+    revert_result = revert_commit(project.path, commit_after, mainline=1)
+    rollback_status = PromotionStatus.AUTO_ROLLBACK if revert_result.ok else PromotionStatus.ROLLBACK_FAILED
+    update_promotion_status(conn, promotion.id, rollback_status)
+
+    if revert_result.ok:
+        # Le merge est réellement annulé dans le dépôt : la tâche ne doit
+        # plus afficher PROMOTED, ce serait trompeur (l'état affiché ne
+        # correspondrait plus à la réalité du dépôt).
+        transition_task(
+            conn, task.id, TaskState.ROLLED_BACK, reason="AUTO_ROLLBACK: merge reverté après échec du health check"
+        )
+    # sinon (ROLLBACK_FAILED) : le merge est toujours en place, la tâche
+    # reste PROMOTED — c'est l'état réel, intervention manuelle requise.
+
+    # Distinct d'un rollback manuel (component="cli.task_rollback") : ceci
+    # est un rollback DE SÉCURITÉ automatique, jamais initié par une saisie
+    # interactive — journalisé sous un component et un status différents
+    # pour rester traçable séparément (voir tests/unit/test_task_promote.py).
+    auto_rollback_details = {
+        "merge_commit": commit_after,
+        "health_check_total": health_result.total,
+        "health_check_passed": health_result.passed,
+        "health_check_failed": health_result.failed,
+        "health_check_errors": health_result.errors,
+        "revert_ok": revert_result.ok,
+        "revert_stdout": revert_result.stdout,
+        "revert_stderr": revert_result.stderr,
+    }
+    insert_audit_log(
+        conn,
+        component="cli.task_promote_auto_rollback",
+        event="AUTO_ROLLBACK déclenché après échec du health check post-promotion",
+        level="ERROR",
+        status=rollback_status.value,
+        task_id=task.id,
+        details=auto_rollback_details,
+    )
+    append_jsonl_event(
+        _logs_dir(),
+        component="cli.task_promote_auto_rollback",
+        event="AUTO_ROLLBACK déclenché après échec du health check post-promotion",
+        level="ERROR",
+        status=rollback_status.value,
+        task_id=task.id,
+        details=auto_rollback_details,
+    )
+    conn.close()
+
+    print(
+        f"[FAILED] health check post-promotion échoué "
+        f"(passed={health_result.passed} failed={health_result.failed} errors={health_result.errors})."
+    )
+    if revert_result.ok:
+        print("[VERIFIED] AUTO_ROLLBACK: merge annulé via un nouveau commit de revert (mainline=1, pas de reset --hard).")
+    else:
+        print(f"[FAILED] AUTO_ROLLBACK a lui-même échoué: {revert_result.stderr} — intervention manuelle requise.")
+    return 1
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -517,6 +781,12 @@ def build_parser() -> argparse.ArgumentParser:
     task_test = task_sub.add_parser("test", help="exécute pytest réellement dans le projet lié à la tâche")
     task_test.add_argument("task_id")
     task_test.set_defaults(func=cmd_task_test)
+
+    task_promote = task_sub.add_parser(
+        "promote", help="merge candidate/<task_id> vers la branche stable + health check post-merge"
+    )
+    task_promote.add_argument("task_id")
+    task_promote.set_defaults(func=cmd_task_promote)
 
     report_parser = subparsers.add_parser(
         "report", help="génère reports/<task_id>.html (statique, données déjà en SQLite)"

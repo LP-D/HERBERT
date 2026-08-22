@@ -9,3 +9,5 @@ class TaskState(str, Enum):
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
     HUMAN_REQUIRED = "HUMAN_REQUIRED"
+    PROMOTED = "PROMOTED"
+    ROLLED_BACK = "ROLLED_BACK"

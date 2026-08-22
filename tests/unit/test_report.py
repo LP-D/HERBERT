@@ -6,10 +6,12 @@ from app.database.migrate import apply_migrations
 from app.database.repository import (
     insert_change_proof,
     insert_project,
+    insert_promotion,
     insert_state_transition,
     insert_task,
 )
-from app.models import ChangeProof, Project, StateTransition, Task
+from app.models import ChangeProof, Project, Promotion, StateTransition, Task
+from app.models.promotion import PromotionStatus
 from app.report_builder import build_report_html, write_report
 from app.state_machine.states import TaskState
 
@@ -132,3 +134,60 @@ def test_report_html_escapes_dangerous_content(isolated_repo_root):
 
     assert "<script>alert" not in html_content
     assert "&lt;script&gt;" in html_content
+
+
+def test_report_includes_promotion_section_when_health_check_passed(isolated_repo_root):
+    task, _project, _proof = _make_task_with_change_proof(isolated_repo_root)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    insert_promotion(
+        conn,
+        Promotion(
+            task_id=task.id,
+            stable_branch="master",
+            candidate_branch=f"candidate/{task.id}",
+            commit_before="abcdef1234567890",
+            commit_after="1234567890abcdef",
+            status=PromotionStatus.HEALTH_CHECK_PASSED,
+        ),
+    )
+    html_content = build_report_html(conn, task, isolated_repo_root / "logs")
+    conn.close()
+
+    assert "HEALTH_CHECK_PASSED" in html_content
+    assert "abcdef123456" in html_content
+    assert "master" in html_content
+    assert f"candidate/{task.id}" in html_content
+
+
+def test_report_includes_auto_rollback_warning(isolated_repo_root):
+    task, _project, _proof = _make_task_with_change_proof(isolated_repo_root)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    insert_promotion(
+        conn,
+        Promotion(
+            task_id=task.id,
+            stable_branch="master",
+            candidate_branch=f"candidate/{task.id}",
+            commit_before="abcdef1234567890",
+            commit_after="1234567890abcdef",
+            status=PromotionStatus.AUTO_ROLLBACK,
+        ),
+    )
+    html_content = build_report_html(conn, task, isolated_repo_root / "logs")
+    conn.close()
+
+    assert "AUTO_ROLLBACK" in html_content
+    assert "cli.task_promote_auto_rollback" in html_content
+    assert "cli.task_rollback" in html_content  # mentionné pour la distinction, pas confondu
+
+
+def test_report_without_promotion_says_so_clearly(isolated_repo_root):
+    task, _project, _proof = _make_task_with_change_proof(isolated_repo_root)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    html_content = build_report_html(conn, task, isolated_repo_root / "logs")
+    conn.close()
+
+    assert "Aucune promotion enregistrée" in html_content

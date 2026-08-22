@@ -27,7 +27,22 @@ LEGAL_TRANSITIONS = {
         TaskState.EXECUTING,
         TaskState.BLOCKED,
     },
-    TaskState.DONE: set(),
+    # DONE -> PROMOTED : gate réel appliqué par `engine task promote` sur le
+    # dernier ChangeProof (VERIFIED_PASS, sans régression), pas seulement
+    # par cette table — voir cmd_task_promote.
+    TaskState.DONE: {TaskState.PROMOTED},
+    # PROMOTED -> DONE : health check post-merge réussi.
+    # PROMOTED -> ROLLED_BACK : health check en échec ET le revert du merge
+    # a réellement réussi (AUTO_ROLLBACK) — voir cmd_task_promote. Si le
+    # revert lui-même échoue (ROLLBACK_FAILED côté `promotions`), la tâche
+    # reste volontairement à PROMOTED : le merge est toujours en place dans
+    # le dépôt, donc l'état ne doit PAS afficher ROLLED_BACK tant que ce
+    # n'est pas réellement le cas.
+    TaskState.PROMOTED: {TaskState.DONE, TaskState.ROLLED_BACK},
+    # ROLLED_BACK : terminal. Le merge a été annulé par un commit de revert
+    # réel (jamais un reset destructeur) ; reprendre le travail nécessite
+    # une nouvelle tâche/candidate, pas une transition depuis celle-ci.
+    TaskState.ROLLED_BACK: set(),
 }
 
 

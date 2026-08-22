@@ -7,6 +7,8 @@ from app.models import (
     ChangeProof,
     CommandLogEntry,
     Project,
+    Promotion,
+    PromotionStatus,
     StateTransition,
     Task,
     TestCaseOutcome,
@@ -282,3 +284,51 @@ def get_latest_audit_log_details(conn: sqlite3.Connection, task_id: str, compone
     if row is None or row["details"] is None:
         return None
     return json.loads(row["details"])
+
+
+# --- promotions (V0.3) ---------------------------------------------------
+
+def _promotion_from_row(row: sqlite3.Row) -> Promotion:
+    return Promotion(
+        id=row["id"],
+        task_id=row["task_id"],
+        stable_branch=row["stable_branch"],
+        candidate_branch=row["candidate_branch"],
+        commit_before=row["commit_before"],
+        commit_after=row["commit_after"],
+        status=PromotionStatus(row["status"]),
+        created_at=row["created_at"],
+    )
+
+
+def insert_promotion(conn: sqlite3.Connection, promotion: Promotion) -> None:
+    conn.execute(
+        """INSERT INTO promotions
+           (id, task_id, stable_branch, candidate_branch, commit_before, commit_after, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            promotion.id,
+            promotion.task_id,
+            promotion.stable_branch,
+            promotion.candidate_branch,
+            promotion.commit_before,
+            promotion.commit_after,
+            promotion.status.value,
+            promotion.created_at.isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def update_promotion_status(conn: sqlite3.Connection, promotion_id: str, status: PromotionStatus) -> None:
+    conn.execute("UPDATE promotions SET status = ? WHERE id = ?", (status.value, promotion_id))
+    conn.commit()
+
+
+def get_latest_promotion_for_task(conn: sqlite3.Connection, task_id: str) -> Promotion | None:
+    row = conn.execute(
+        "SELECT * FROM promotions WHERE task_id = ? ORDER BY created_at DESC LIMIT 1", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return _promotion_from_row(row)

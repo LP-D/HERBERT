@@ -83,6 +83,34 @@ def diff_files_since(repo_path: str | Path, base_commit: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
+def merge_branch(repo_path: str | Path, source_branch: str, message: str | None = None, no_ff: bool = True) -> GitResult:
+    """Merge `source_branch` DANS la branche déjà checkout (l'appelant doit
+    avoir fait checkout_branch(stable_branch) avant). --no-ff par défaut :
+    garde un commit de merge identifiable, nécessaire pour `revert_commit`
+    (un revert de merge a besoin de -m <mainline>, donc d'un vrai commit de
+    merge, pas d'un fast-forward)."""
+    args = ["merge"]
+    if no_ff:
+        args.append("--no-ff")
+    if message:
+        args.extend(["-m", message])
+    args.append(source_branch)
+    return _run_git(repo_path, args)
+
+
+def revert_commit(repo_path: str | Path, commit_ref: str, mainline: int | None = None) -> GitResult:
+    """git revert : annule un commit via un NOUVEAU commit, sans réécrire
+    l'historique (contrairement à rollback_to_commit/reset --hard). Utilisé
+    pour l'AUTO_ROLLBACK d'un merge de promotion en échec de health check —
+    mainline=1 pour un commit de merge (garde la branche stable comme
+    parent principal)."""
+    args = ["revert", "--no-edit"]
+    if mainline is not None:
+        args.extend(["-m", str(mainline)])
+    args.append(commit_ref)
+    return _run_git(repo_path, args)
+
+
 def push_to_origin(repo_path: str | Path, branch: str | None = None) -> GitResult:
     """Push explicite vers origin/<branch>. N'est appelé nulle part ailleurs
     dans HERBERT que par la commande CLI `engine sync push` — jamais en

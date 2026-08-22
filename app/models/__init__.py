@@ -5,6 +5,7 @@ from app.models.state_transition import StateTransition
 from app.models.command_log_entry import CommandLogEntry
 from app.models.change_proof import ChangeProof
 from app.models.test_result import TestCaseOutcome, TestCaseResult, TestResult, TestResultStatus
+from app.models.promotion import Promotion, PromotionStatus
 
 __all__ = [
     "CommandDecision",
@@ -18,4 +19,6 @@ __all__ = [
     "TestResultStatus",
     "TestCaseResult",
     "TestCaseOutcome",
+    "Promotion",
+    "PromotionStatus",
 ]

@@ -9,7 +9,12 @@ import sqlite3
 from datetime import date
 from pathlib import Path
 
-from app.database.repository import get_latest_change_proof, get_latest_test_result_for_task, get_project
+from app.database.repository import (
+    get_latest_change_proof,
+    get_latest_promotion_for_task,
+    get_latest_test_result_for_task,
+    get_project,
+)
 from app.models import Task
 
 _STYLE = """
@@ -60,10 +65,21 @@ def _relevant_jsonl_files(logs_dir: Path, start: date, end: date) -> list[Path]:
     return matches
 
 
+_TASK_STATE_BADGE_KIND = {
+    "DONE": "pass",
+    "PROMOTED": "pass",
+    "FAILED": "fail",
+    "BLOCKED": "fail",
+    "ROLLED_BACK": "fail",
+    "HUMAN_REQUIRED": "fail",
+}
+
+
 def build_report_html(conn: sqlite3.Connection, task: Task, logs_dir: Path) -> str:
     project = get_project(conn, task.project_id)
     proof = get_latest_change_proof(conn, task.id)
     test_result = get_latest_test_result_for_task(conn, task.id)
+    promotion = get_latest_promotion_for_task(conn, task.id)
     transitions = _state_transitions_rows(conn, task.id)
 
     project_name = project.name if project else "(projet introuvable)"
@@ -114,6 +130,41 @@ def build_report_html(conn: sqlite3.Connection, task: Task, logs_dir: Path) -> s
     else:
         test_result_html = "<p><em>Aucun TestResult enregistré pour cette tâche.</em></p>"
 
+    if promotion is None:
+        promotion_html = "<p><em>Aucune promotion enregistrée pour cette tâche.</em></p>"
+    else:
+        promotion_kind = "pass" if promotion.status.value == "HEALTH_CHECK_PASSED" else "fail"
+        promotion_html = f"""
+        <p>Statut : {_badge(promotion.status.value, promotion_kind)}<br>
+        Branche stable : <code>{_esc(promotion.stable_branch)}</code>
+        &larr; branche candidate : <code>{_esc(promotion.candidate_branch)}</code><br>
+        Commit avant : <code>{_esc(promotion.commit_before[:12])}</code>
+        &rarr; commit après : <code>{_esc(promotion.commit_after[:12])}</code><br>
+        Horodatage : {_esc(promotion.created_at.isoformat())}</p>
+        """
+        if test_result is not None:
+            promotion_html += (
+                f"<p>Résultat du health check post-promotion : "
+                f"{_badge(test_result.status.value, 'pass' if test_result.status.value == 'VERIFIED_PASS' else 'fail')} "
+                f"— passed={test_result.passed}, failed={test_result.failed}, errors={test_result.errors}</p>"
+            )
+        if promotion.status.value == "AUTO_ROLLBACK":
+            promotion_html += (
+                '<div class="limitation-box"><strong>AUTO_ROLLBACK :</strong> le health check '
+                "post-promotion a échoué. Le merge a été automatiquement annulé via un "
+                "<code>git revert</code> du commit de merge (jamais un reset destructeur) — "
+                "voir le composant <code>cli.task_promote_auto_rollback</code> dans "
+                "audit_log/logs pour le détail complet. Ceci est distinct d'un rollback "
+                "manuel (<code>engine task rollback</code>, composant "
+                "<code>cli.task_rollback</code>).</div>"
+            )
+        elif promotion.status.value == "ROLLBACK_FAILED":
+            promotion_html += (
+                '<div class="limitation-box"><strong>ROLLBACK_FAILED :</strong> le health '
+                "check a échoué ET la tentative d'AUTO_ROLLBACK (git revert) a elle-même "
+                "échoué. Intervention manuelle requise sur le dépôt du projet.</div>"
+            )
+
     start_date = task.created_at.date()
     jsonl_files = _relevant_jsonl_files(logs_dir, start_date, end_date)
     jsonl_html = "".join(f"<li><code>{_esc(p)}</code></li>" for p in jsonl_files) or "<li><em>aucun fichier trouvé pour cette période</em></li>"
@@ -129,7 +180,7 @@ def build_report_html(conn: sqlite3.Connection, task: Task, logs_dir: Path) -> s
 <h1>Rapport de tâche</h1>
 <p><strong>Projet :</strong> {_esc(project_name)}<br>
 <strong>Description :</strong> {_esc(task.description)}<br>
-<strong>État actuel :</strong> {_badge(task.status.value, 'neutral')}<br>
+<strong>État actuel :</strong> {_badge(task.status.value, _TASK_STATE_BADGE_KIND.get(task.status.value, 'neutral'))}<br>
 <strong>Créée le :</strong> {_esc(task.created_at.isoformat())}</p>
 
 <h2>Dernier ChangeProof</h2>
@@ -137,6 +188,9 @@ def build_report_html(conn: sqlite3.Connection, task: Task, logs_dir: Path) -> s
 
 <h2>Dernier résultat de test</h2>
 {test_result_html}
+
+<h2>Promotion et health check</h2>
+{promotion_html}
 
 <h2>Historique des transitions d'état</h2>
 <table>
