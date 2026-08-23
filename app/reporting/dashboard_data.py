@@ -25,10 +25,19 @@ _SYSTEM_TRANSITION_REASONS = {
 }
 
 
-def list_projects_with_task_counts(conn: sqlite3.Connection) -> list[dict]:
+def list_projects_with_task_counts(conn: sqlite3.Connection, include_archived: bool = False) -> list[dict]:
     """Un projet par entrée, avec un compteur de tâches par état (0 pour les
-    états absents — pas seulement les états présents)."""
-    projects = conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
+    états absents — pas seulement les états présents).
+
+    Soft delete (V0.5, point 2) : exclut par défaut les projets archivés
+    (archived_at IS NOT NULL) — `include_archived=True` les inclut aussi
+    (chaque entrée porte `archived_at`, pour que l'appelant décide quoi en
+    faire — ex. générer quand même la page de détail d'un projet archivé,
+    tout en l'excluant des cartes de index.html)."""
+    if include_archived:
+        projects = conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
+    else:
+        projects = conn.execute("SELECT * FROM projects WHERE archived_at IS NULL ORDER BY name").fetchall()
 
     result = []
     for p in projects:
@@ -45,6 +54,7 @@ def list_projects_with_task_counts(conn: sqlite3.Connection) -> list[dict]:
                 "name": p["name"],
                 "path": p["path"],
                 "created_at": p["created_at"],
+                "archived_at": p["archived_at"],
                 "task_counts": counts,
                 "total_tasks": sum(counts.values()),
             }
@@ -52,13 +62,24 @@ def list_projects_with_task_counts(conn: sqlite3.Connection) -> list[dict]:
     return result
 
 
-def list_tasks_for_project(conn: sqlite3.Connection, project_id: str) -> list[dict]:
-    """Tâches d'un projet, plus récentes en premier (par updated_at)."""
-    rows = conn.execute(
-        """SELECT id, description, status, created_at, updated_at
-           FROM tasks WHERE project_id = ? ORDER BY updated_at DESC""",
-        (project_id,),
-    ).fetchall()
+def list_tasks_for_project(conn: sqlite3.Connection, project_id: str, include_archived: bool = False) -> list[dict]:
+    """Tâches d'un projet, plus récentes en premier (par updated_at).
+
+    Soft delete (V0.5, point 2) : exclut par défaut les tâches archivées —
+    `include_archived=True` les inclut aussi (chaque entrée porte
+    `archived_at`)."""
+    if include_archived:
+        rows = conn.execute(
+            "SELECT id, description, status, created_at, updated_at, archived_at "
+            "FROM tasks WHERE project_id = ? ORDER BY updated_at DESC",
+            (project_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, description, status, created_at, updated_at, archived_at "
+            "FROM tasks WHERE project_id = ? AND archived_at IS NULL ORDER BY updated_at DESC",
+            (project_id,),
+        ).fetchall()
     return [
         {
             "id": r["id"],
@@ -66,6 +87,7 @@ def list_tasks_for_project(conn: sqlite3.Connection, project_id: str) -> list[di
             "status": r["status"],
             "created_at": r["created_at"],
             "updated_at": r["updated_at"],
+            "archived_at": r["archived_at"],
         }
         for r in rows
     ]

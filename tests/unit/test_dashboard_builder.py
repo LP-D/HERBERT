@@ -2,6 +2,8 @@ import re
 from pathlib import Path
 
 from app.database.repository import (
+    archive_project,
+    archive_task,
     insert_audit_log,
     insert_project,
     insert_state_transition,
@@ -149,3 +151,59 @@ def test_empty_database_generates_dashboard_without_crashing(db_conn, tmp_path):
     assert "index.html" in result["pages"]
     content = (tmp_path / "dashboard" / "index.html").read_text(encoding="utf-8")
     assert "hb-empty" in content or "Aucun" in content
+
+
+# --- soft delete (V0.5, point 2) ------------------------------------------
+
+def test_archived_project_hidden_from_index_but_page_still_generated(db_conn, tmp_path):
+    project, task = _seed(db_conn)
+    archive_project(db_conn, project.id, "2026-08-23T00:00:00+00:00")
+
+    result = build_dashboard(db_conn, tmp_path / "dashboard", tmp_path / "logs")
+
+    # toujours générée (« reste interrogeable »), avec une mention explicite
+    assert f"project/{project.id}.html" in result["pages"]
+    project_page = (tmp_path / "dashboard" / "project" / f"{project.id}.html").read_text(encoding="utf-8")
+    assert "archivé" in project_page.lower()
+
+    # mais absente de l'index par défaut
+    index_content = (tmp_path / "dashboard" / "index.html").read_text(encoding="utf-8")
+    assert project.name not in index_content
+
+
+def test_archived_task_hidden_from_project_table_but_page_still_generated(db_conn, tmp_path):
+    project, task = _seed(db_conn)
+    archive_task(db_conn, task.id, "2026-08-23T00:00:00+00:00")
+
+    result = build_dashboard(db_conn, tmp_path / "dashboard", tmp_path / "logs")
+
+    assert f"task/{task.id}.html" in result["pages"]
+    task_page = (tmp_path / "dashboard" / "task" / f"{task.id}.html").read_text(encoding="utf-8")
+    assert "archivé" in task_page.lower()
+
+    project_page = (tmp_path / "dashboard" / "project" / f"{project.id}.html").read_text(encoding="utf-8")
+    assert task.description not in project_page  # absente du tableau par défaut
+
+
+def test_no_dead_links_with_archived_entities_present(db_conn, tmp_path):
+    """Renforce test_build_dashboard_no_dead_internal_links : un lien vers
+    une tâche/un projet archivé (ex. depuis decisions.html) ne doit JAMAIS
+    devenir un lien mort — c'est précisément le risque identifié en
+    conception pour le point 2."""
+    project, task = _seed(db_conn)
+    archive_project(db_conn, project.id, "2026-08-23T00:00:00+00:00")
+    archive_task(db_conn, task.id, "2026-08-23T00:00:00+00:00")
+
+    dashboard_dir = tmp_path / "dashboard"
+    build_dashboard(db_conn, dashboard_dir, tmp_path / "logs")
+
+    all_files = {p.relative_to(dashboard_dir).as_posix() for p in dashboard_dir.rglob("*") if p.is_file()}
+    for html_file in dashboard_dir.rglob("*.html"):
+        content = html_file.read_text(encoding="utf-8")
+        base_dir = html_file.parent
+        for link in _HREF_SRC_RE.findall(content):
+            if link.startswith(("http://", "https://", "#")):
+                continue
+            resolved = (base_dir / link).resolve()
+            rel = resolved.relative_to(dashboard_dir.resolve()).as_posix()
+            assert rel in all_files, f"lien mort dans {html_file.name}: {link} -> {rel}"

@@ -1,4 +1,6 @@
 from app.database.repository import (
+    archive_project,
+    archive_task,
     insert_audit_log,
     insert_project,
     insert_promotion,
@@ -191,3 +193,43 @@ def test_list_audit_log_includes_entries_without_task(db_conn):
     assert result[0]["task_id"] is None
     assert result[0]["project_name"] is None
     assert result[0]["component"] == "cli.doctor"
+
+
+# --- soft delete (V0.5, point 2) ------------------------------------------
+
+def test_list_projects_with_task_counts_excludes_archived_by_default(db_conn):
+    active = Project(name="p-actif-dash", path="C:/p-actif-dash")
+    archived = Project(name="p-archive-dash", path="C:/p-archive-dash")
+    insert_project(db_conn, active)
+    insert_project(db_conn, archived)
+    archive_project(db_conn, archived.id, "2026-08-23T00:00:00+00:00")
+
+    default_result = list_projects_with_task_counts(db_conn)
+    names_default = {p["name"] for p in default_result}
+    assert "p-actif-dash" in names_default
+    assert "p-archive-dash" not in names_default
+
+    full_result = list_projects_with_task_counts(db_conn, include_archived=True)
+    names_full = {p["name"] for p in full_result}
+    assert "p-archive-dash" in names_full
+    archived_entry = next(p for p in full_result if p["name"] == "p-archive-dash")
+    assert archived_entry["archived_at"] is not None
+
+
+def test_list_tasks_for_project_excludes_archived_by_default(db_conn):
+    project = Project(name="p-taches-archive", path="C:/p-taches-archive")
+    insert_project(db_conn, project)
+    active_task = Task(project_id=project.id, description="active")
+    archived_task = Task(project_id=project.id, description="archivée")
+    insert_task(db_conn, active_task)
+    insert_task(db_conn, archived_task)
+    archive_task(db_conn, archived_task.id, "2026-08-23T00:00:00+00:00")
+
+    default_result = list_tasks_for_project(db_conn, project.id)
+    ids_default = {t["id"] for t in default_result}
+    assert active_task.id in ids_default
+    assert archived_task.id not in ids_default
+
+    full_result = list_tasks_for_project(db_conn, project.id, include_archived=True)
+    ids_full = {t["id"] for t in full_result}
+    assert archived_task.id in ids_full

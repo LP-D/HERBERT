@@ -33,23 +33,60 @@ def insert_project(conn: sqlite3.Connection, project: Project) -> None:
     conn.commit()
 
 
+def _project_from_row(row: sqlite3.Row) -> Project:
+    return Project(
+        id=row["id"],
+        name=row["name"],
+        path=row["path"],
+        created_at=row["created_at"],
+        archived_at=row["archived_at"],
+    )
+
+
 def get_project_by_name(conn: sqlite3.Connection, name: str) -> Project | None:
     row = conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
     if row is None:
         return None
-    return Project(id=row["id"], name=row["name"], path=row["path"], created_at=row["created_at"])
+    return _project_from_row(row)
 
 
-def list_projects(conn: sqlite3.Connection) -> list[Project]:
-    rows = conn.execute("SELECT * FROM projects ORDER BY created_at").fetchall()
-    return [Project(id=r["id"], name=r["name"], path=r["path"], created_at=r["created_at"]) for r in rows]
+def list_projects(conn: sqlite3.Connection, include_archived: bool = False) -> list[Project]:
+    """Par défaut, exclut les projets archivés (voir archive_project) —
+    jamais supprimés physiquement, juste hors des vues de listing par
+    défaut. `include_archived=True` (ex. `engine project list
+    --include-archived`) les inclut aussi."""
+    if include_archived:
+        rows = conn.execute("SELECT * FROM projects ORDER BY created_at").fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM projects WHERE archived_at IS NULL ORDER BY created_at").fetchall()
+    return [_project_from_row(r) for r in rows]
 
 
 def get_project(conn: sqlite3.Connection, project_id: str) -> Project | None:
+    """Lookup par id : TOUJOURS retourné, archivé ou non — l'archivage
+    masque des LISTES, jamais une entité déjà identifiée par son id
+    (« reste interrogeable », voir migrations/0006_archived_at.sql)."""
     row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
     if row is None:
         return None
-    return Project(id=row["id"], name=row["name"], path=row["path"], created_at=row["created_at"])
+    return _project_from_row(row)
+
+
+def archive_project(conn: sqlite3.Connection, project_id: str, archived_at: str) -> None:
+    """Soft delete : ne supprime RIEN physiquement, ne touche à aucune
+    table d'audit (audit_log, state_transitions, commands, change_proofs
+    restent intacts, append-only). Le garde-fou (refuser si des tâches
+    non archivées existent) est appliqué par l'appelant (CLI), pas ici —
+    cette fonction est la primitive, pas la politique."""
+    conn.execute("UPDATE projects SET archived_at = ? WHERE id = ?", (archived_at, project_id))
+    conn.commit()
+
+
+def count_unarchived_tasks(conn: sqlite3.Connection, project_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND archived_at IS NULL", (project_id,)
+    ).fetchone()
+    return row["n"]
 
 
 # --- tasks --------------------------------------------------------------
@@ -71,6 +108,8 @@ def insert_task(conn: sqlite3.Connection, task: Task) -> None:
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Task | None:
+    """Lookup par id : TOUJOURS retourné, archivée ou non — voir
+    get_project() pour la même règle côté projet."""
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         return None
@@ -81,6 +120,7 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Task | None:
         status=TaskState(row["status"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        archived_at=row["archived_at"],
     )
 
 
@@ -89,6 +129,12 @@ def update_task_status(conn: sqlite3.Connection, task_id: str, new_status: TaskS
         "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
         (new_status.value, _utc_now_iso(), task_id),
     )
+    conn.commit()
+
+
+def archive_task(conn: sqlite3.Connection, task_id: str, archived_at: str) -> None:
+    """Soft delete : ne supprime rien, ne touche à aucune table d'audit."""
+    conn.execute("UPDATE tasks SET archived_at = ? WHERE id = ?", (archived_at, task_id))
     conn.commit()
 
 

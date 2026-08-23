@@ -13,6 +13,9 @@ class Task(BaseModel):
     status: TaskState = TaskState.RECEIVED
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Soft delete (V0.5, point 2) : None = actif. Jamais de suppression
+    # physique — voir app/database/repository.py::archive_task.
+    archived_at: datetime | None = None
 
     @field_validator("description")
     @classmethod

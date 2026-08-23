@@ -1,6 +1,7 @@
 import argparse
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -13,6 +14,9 @@ from app.config import load_config, write_default_config  # noqa: E402
 from app.database.connection import get_connection  # noqa: E402
 from app.database.migrate import apply_migrations, current_schema_version  # noqa: E402
 from app.database.repository import (  # noqa: E402
+    archive_project,
+    archive_task,
+    count_unarchived_tasks,
     get_latest_audit_log_details,
     get_latest_change_proof,
     get_latest_promotion_for_task,
@@ -187,7 +191,7 @@ def cmd_project_add(args: argparse.Namespace) -> int:
 
 def cmd_project_list(args: argparse.Namespace) -> int:
     conn = _connect()
-    projects = list_projects(conn)
+    projects = list_projects(conn, include_archived=args.include_archived)
     conn.close()
 
     if not projects:
@@ -195,7 +199,51 @@ def cmd_project_list(args: argparse.Namespace) -> int:
         return 0
 
     for p in projects:
-        print(f"[VERIFIED] {p.id}  {p.name}  {p.path}  {p.created_at.isoformat()}")
+        archived_suffix = f"  [ARCHIVÉ le {p.archived_at.isoformat()}]" if p.archived_at else ""
+        print(f"[VERIFIED] {p.id}  {p.name}  {p.path}  {p.created_at.isoformat()}{archived_suffix}")
+    return 0
+
+
+def cmd_project_archive(args: argparse.Namespace) -> int:
+    """engine project archive <project_id> : soft delete — aucune ligne
+    d'audit_log/state_transitions/commands/change_proofs n'est jamais
+    supprimée. Refuse par défaut si des tâches non archivées existent
+    encore sur ce projet (--force + confirmation explicite pour outrepasser)
+    — pour éviter qu'un projet disparaisse des vues normales pendant que du
+    travail non archivé y est encore rattaché."""
+    conn = _connect()
+    project = get_project(conn, args.project_id)
+    if project is None:
+        conn.close()
+        print(f"[FAILED] projet introuvable: {args.project_id}")
+        return 1
+    if project.archived_at is not None:
+        conn.close()
+        print(f"[VERIFIED] projet déjà archivé le {project.archived_at.isoformat()}: {project.id}")
+        return 0
+
+    unarchived = count_unarchived_tasks(conn, project.id)
+    if unarchived > 0 and not args.force:
+        conn.close()
+        print(
+            f"[BLOCKED] archivage refusé: {unarchived} tâche(s) non archivée(s) existent encore sur ce projet. "
+            "Archivez-les d'abord (engine task archive <task_id>), ou relancez avec --force."
+        )
+        return 1
+
+    if unarchived > 0 and args.force:
+        print(f"[BLOCKED] --force demandé malgré {unarchived} tâche(s) non archivée(s) sur ce projet.")
+        confirmation = input("Tapez exactement OUI pour confirmer l'archivage forcé: ")
+        if confirmation.strip() != "OUI":
+            conn.close()
+            print("[BLOCKED] confirmation non reçue telle quelle, archivage annulé.")
+            return 1
+
+    archived_at = datetime.now(timezone.utc).isoformat()
+    archive_project(conn, project.id, archived_at)
+    conn.close()
+
+    print(f"[VERIFIED] projet archivé: {project.id} ({project.name})")
     return 0
 
 
@@ -229,6 +277,27 @@ def cmd_task_create(args: argparse.Namespace) -> int:
 
 def cmd_task_status(args: argparse.Namespace) -> int:
     conn = _connect()
+
+    # Soft delete (V0.5, point 2) : une tâche archivée, OU dont le projet
+    # est archivé, est traitée comme invisible par défaut — pas seulement
+    # absente des listes, même un lookup direct par id. --include-archived
+    # la rend à nouveau consultable explicitement. Ne s'applique que si la
+    # tâche existe réellement (sinon le message "tâche introuvable" normal
+    # ci-dessous reste inchangé).
+    if not args.include_archived:
+        precheck_task = get_task(conn, args.id)
+        if precheck_task is not None:
+            precheck_project = get_project(conn, precheck_task.project_id)
+            archived = precheck_task.archived_at is not None or (
+                precheck_project is not None and precheck_project.archived_at is not None
+            )
+            if archived:
+                conn.close()
+                print(
+                    f"[FAILED] tâche archivée (ou son projet l'est) — invisible par défaut: {args.id}. "
+                    "Relancez avec --include-archived pour la consulter quand même."
+                )
+                return 1
 
     if args.to is None:
         task = get_task(conn, args.id)
@@ -338,6 +407,33 @@ def cmd_task_deactivate(args: argparse.Namespace) -> int:
 
     print(f"[FAILED] cette tâche n'était pas la tâche active de son projet, rien désactivé: {args.task_id}")
     return 1
+
+
+def cmd_task_archive(args: argparse.Namespace) -> int:
+    """engine task archive <task_id> : soft delete — aucune ligne
+    d'audit_log/state_transitions/commands/change_proofs n'est jamais
+    supprimée. Désactive aussi la tâche si elle était la tâche active de
+    son projet (best-effort, voir app/active_task.py) : une tâche archivée
+    n'a plus vocation à recevoir des commandes attribuées."""
+    conn = _connect()
+    task = get_task(conn, args.task_id)
+    if task is None:
+        conn.close()
+        print(f"[FAILED] tâche introuvable: {args.task_id}")
+        return 1
+    if task.archived_at is not None:
+        conn.close()
+        print(f"[VERIFIED] tâche déjà archivée le {task.archived_at.isoformat()}: {task.id}")
+        return 0
+
+    archived_at = datetime.now(timezone.utc).isoformat()
+    archive_task(conn, task.id, archived_at)
+    deactivate_task_if_active(conn, task.id)
+    _regenerate_dashboard(conn)
+    conn.close()
+
+    print(f"[VERIFIED] tâche archivée: {task.id}")
+    return 0
 
 
 def _get_task_and_project(conn: sqlite3.Connection, task_id: str) -> tuple[Task | None, Project | None, str | None]:
@@ -879,7 +975,20 @@ def build_parser() -> argparse.ArgumentParser:
     project_add.set_defaults(func=cmd_project_add)
 
     project_list = project_sub.add_parser("list", help="liste les projets")
+    project_list.add_argument(
+        "--include-archived", action="store_true", default=False, help="inclut aussi les projets archivés"
+    )
     project_list.set_defaults(func=cmd_project_list)
+
+    project_archive = project_sub.add_parser(
+        "archive", help="soft delete d'un projet (refuse si des tâches non archivées existent, sauf --force)"
+    )
+    project_archive.add_argument("project_id")
+    project_archive.add_argument(
+        "--force", action="store_true", default=False,
+        help="outrepasse le refus si des tâches non archivées existent (confirmation explicite requise)",
+    )
+    project_archive.set_defaults(func=cmd_project_archive)
 
     task_parser = subparsers.add_parser("task", help="gestion des tâches")
     task_sub = task_parser.add_subparsers(dest="task_command", required=True)
@@ -893,7 +1002,15 @@ def build_parser() -> argparse.ArgumentParser:
     task_status.add_argument("--id", required=True)
     task_status.add_argument("--to", required=False, default=None, help="nouvel état souhaité (optionnel)")
     task_status.add_argument("--reason", required=False, default=None)
+    task_status.add_argument(
+        "--include-archived", action="store_true", default=False,
+        help="consulte la tâche même si elle (ou son projet) est archivé",
+    )
     task_status.set_defaults(func=cmd_task_status)
+
+    task_archive = task_sub.add_parser("archive", help="soft delete d'une tâche")
+    task_archive.add_argument("task_id")
+    task_archive.set_defaults(func=cmd_task_archive)
 
     task_activate = task_sub.add_parser(
         "activate", help="active une tâche pour son projet (attribution task_id aux commandes des hooks)"

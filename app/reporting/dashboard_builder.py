@@ -344,8 +344,14 @@ def _build_project_html(project: dict, tasks: list[dict]) -> str:
           <td class="mono" data-sort-value="{_esc(t['updated_at'])}">{_esc(t['updated_at'])}</td>
         </tr>""")
 
+    archived_notice = (
+        f'<p class="hb-empty">Ce projet est archivé depuis le {_esc(project["archived_at"])} — '
+        f"invisible sur le tableau de bord par défaut, mais toujours consultable directement.</p>"
+        if project.get("archived_at") else ""
+    )
     body = f"""
     <h1>{_esc(project['name'])}</h1>
+    {archived_notice}
     <p class="path mono">{_esc(project['path'])}</p>
     <input class="hb-filter" id="task-filter" placeholder="Filtrer les tâches (id, description, état)...">
     <table class="hb-table" id="task-table">
@@ -389,6 +395,11 @@ def _build_task_html(conn: sqlite3.Connection, task_row: dict, project: dict, lo
     """
 
     nav = _nav(("Dashboard", "../index.html"), (project["name"], f"../project/{project['id']}.html"), (task.id[:8], None))
+    archived_notice = (
+        f'<p class="hb-empty">Cette tâche est archivée depuis le {_esc(task_row["archived_at"])} — '
+        f"invisible sur le tableau de bord par défaut, mais toujours consultable directement.</p>"
+        if task_row.get("archived_at") else ""
+    )
 
     # Réutilisation de app.report_builder.build_report_html telle quelle
     # (pas de duplication de sa logique) : on injecte la nav dashboard + le
@@ -398,7 +409,7 @@ def _build_task_html(conn: sqlite3.Connection, task_row: dict, project: dict, lo
     out = base_report_html.replace(
         "</head>", '<link rel="stylesheet" href="../assets/style.css"></head>'
     )
-    out = out.replace("<body>", f"<body>\n{nav}")
+    out = out.replace("<body>", f"<body>\n{nav}\n{archived_notice}")
     out = out.replace("</body>", f"{diagram_section}\n</body>")
     return out
 
@@ -513,17 +524,28 @@ def build_dashboard(conn: sqlite3.Connection, dashboard_dir: Path, logs_dir: Pat
     (dashboard_dir / "assets" / "app.js").write_text(_APP_JS, encoding="utf-8", errors="replace")
     written["assets"] += ["assets/style.css", "assets/app.js"]
 
-    projects = list_projects_with_task_counts(conn)
-    (dashboard_dir / "index.html").write_text(_build_index_html(projects), encoding="utf-8", errors="replace")
+    # Soft delete (V0.5, point 2) : TOUTES les entités (archivées ou non)
+    # reçoivent une page de détail — un lien depuis decisions.html/
+    # audit.html vers une tâche archivée (ou son projet archivé) ne doit
+    # jamais devenir un lien mort (voir test_dashboard_offline.py et
+    # test_build_dashboard_no_dead_internal_links). Seules les LISTES de
+    # navigation (cartes de index.html, tableau de tâches d'une page
+    # projet) appliquent le filtre par défaut — la présence directe des
+    # pages reste "toujours interrogeable", conforme à la contrainte
+    # append-only du point 2.
+    all_projects = list_projects_with_task_counts(conn, include_archived=True)
+    visible_projects = [p for p in all_projects if not p["archived_at"]]
+    (dashboard_dir / "index.html").write_text(_build_index_html(visible_projects), encoding="utf-8", errors="replace")
     written["pages"].append("index.html")
 
-    for project in projects:
-        tasks = list_tasks_for_project(conn, project["id"])
-        page = _build_project_html(project, tasks)
+    for project in all_projects:
+        all_tasks = list_tasks_for_project(conn, project["id"], include_archived=True)
+        visible_tasks = [t for t in all_tasks if not t["archived_at"]]
+        page = _build_project_html(project, visible_tasks)
         (dashboard_dir / "project" / f"{project['id']}.html").write_text(page, encoding="utf-8", errors="replace")
         written["pages"].append(f"project/{project['id']}.html")
 
-        for task_row in tasks:
+        for task_row in all_tasks:
             task_page = _build_task_html(conn, task_row, project, logs_dir)
             (dashboard_dir / "task" / f"{task_row['id']}.html").write_text(task_page, encoding="utf-8", errors="replace")
             written["pages"].append(f"task/{task_row['id']}.html")
