@@ -16,12 +16,20 @@ def transition_task(
     task_id: str,
     to_state: TaskState,
     reason: str | None = None,
+    is_human_decision: bool = False,
 ) -> tuple[bool, Task, StateTransition]:
     """Tente de faire transiter une tâche vers `to_state`.
 
     La transition est TOUJOURS journalisée dans state_transitions, qu'elle
     soit légale ou non. Si elle est illégale, le statut de la tâche n'est
     pas modifié et allowed=False est retourné (jamais d'échec silencieux).
+
+    `is_human_decision` (V0.5, point 3) : garanti par le schéma, PAS déduit
+    de `reason`. Défaut False car les deux vrais appelants internes à ce
+    module (advance_after_test_result, ci-dessous) sont TOUJOURS
+    automatiques — le seul site humain (app/cli/main.py::cmd_task_status,
+    --to/--reason tapés par un humain) passe True explicitement. Voir
+    migrations/0007_is_human_decision.sql pour le détail du choix.
     """
     task = get_task(conn, task_id)
     if task is None:
@@ -35,6 +43,7 @@ def transition_task(
         to_state=to_state,
         allowed=allowed,
         reason=reason,
+        is_human_decision=is_human_decision,
     )
     insert_state_transition(conn, transition)
 
@@ -71,10 +80,12 @@ def advance_after_test_result(conn: sqlite3.Connection, task: Task, passed: bool
         return task
 
     for step in path:
-        allowed, task, _ = transition_task(conn, task.id, step)
+        # Toujours automatique : advance_after_test_result n'est jamais
+        # invoquée avec une saisie humaine directe.
+        allowed, task, _ = transition_task(conn, task.id, step, is_human_decision=False)
         if not allowed:
             return task
 
     target = TaskState.DONE if passed else TaskState.FAILED
-    _, task, _ = transition_task(conn, task.id, target)
+    _, task, _ = transition_task(conn, task.id, target, is_human_decision=False)
     return task

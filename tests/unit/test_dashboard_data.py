@@ -72,7 +72,10 @@ def test_list_tasks_for_project_empty_for_unknown_project(db_conn):
     assert list_tasks_for_project(db_conn, "introuvable") == []
 
 
-def test_list_human_decisions_excludes_system_reasons_and_null(db_conn):
+def test_list_human_decisions_filters_on_is_human_decision_column(db_conn):
+    """V0.5 point 3 : garanti par la colonne is_human_decision, plus une
+    heuristique sur `reason` — une décision humaine SANS --reason doit
+    désormais apparaître (c'était impossible avec l'ancienne heuristique)."""
     project, t1, _t2, _t3 = _seed_project_with_tasks(db_conn)
 
     insert_state_transition(
@@ -80,29 +83,39 @@ def test_list_human_decisions_excludes_system_reasons_and_null(db_conn):
         StateTransition(
             task_id=t1.id, from_state=TaskState.RECEIVED, to_state=TaskState.BLOCKED,
             allowed=True, reason="décision humaine explicite via --reason",
+            is_human_decision=True,
+        ),
+    )
+    insert_state_transition(
+        db_conn,
+        StateTransition(
+            task_id=t1.id, from_state=TaskState.BLOCKED, to_state=TaskState.EXECUTING,
+            allowed=True, reason=None, is_human_decision=True,  # humain SANS --reason
         ),
     )
     insert_state_transition(
         db_conn,
         StateTransition(
             task_id=t1.id, from_state=TaskState.EXECUTING, to_state=TaskState.TESTING,
-            allowed=True, reason=None,  # avancée automatique (advance_after_test_result)
+            allowed=True, reason=None, is_human_decision=False,  # avancée automatique
         ),
     )
     insert_state_transition(
         db_conn,
         StateTransition(
             task_id=t1.id, from_state=TaskState.DONE, to_state=TaskState.PROMOTED,
-            allowed=True, reason="merge de promotion réussi",  # système (task promote)
+            allowed=True, reason="merge de promotion réussi", is_human_decision=False,  # système
         ),
     )
 
     result = list_human_decisions(db_conn)
 
-    assert len(result) == 1
-    assert result[0]["reason"] == "décision humaine explicite via --reason"
-    assert result[0]["task_id"] == t1.id
-    assert result[0]["project_name"] == project.name
+    assert len(result) == 2
+    reasons = {r["reason"] for r in result}
+    assert "décision humaine explicite via --reason" in reasons
+    assert None in reasons  # la décision humaine sans --reason apparaît bien
+    assert all(r["task_id"] == t1.id for r in result)
+    assert all(r["project_name"] == project.name for r in result)
 
 
 def test_list_human_decisions_respects_limit(db_conn):
@@ -112,7 +125,7 @@ def test_list_human_decisions_respects_limit(db_conn):
             db_conn,
             StateTransition(
                 task_id=t1.id, from_state=TaskState.RECEIVED, to_state=TaskState.BLOCKED,
-                allowed=True, reason=f"raison humaine {i}",
+                allowed=True, reason=f"raison humaine {i}", is_human_decision=True,
             ),
         )
 

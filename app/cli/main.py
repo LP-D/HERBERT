@@ -346,7 +346,12 @@ def cmd_task_status(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        allowed, task, transition = transition_task(conn, args.id, to_state, reason=args.reason)
+        # Seul site d'appel réellement humain de tout le code (V0.5, point
+        # 3) : --to/--reason tapés directement par un humain via cette
+        # commande CLI. Voir migrations/0007_is_human_decision.sql.
+        allowed, task, transition = transition_task(
+            conn, args.id, to_state, reason=args.reason, is_human_decision=True
+        )
     except TaskNotFoundError as exc:
         conn.close()
         print(f"[FAILED] {exc}")
@@ -720,7 +725,9 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
     )
     insert_promotion(conn, promotion)
 
-    transition_task(conn, task.id, TaskState.PROMOTED, reason="merge de promotion réussi")
+    transition_task(
+        conn, task.id, TaskState.PROMOTED, reason="merge de promotion réussi", is_human_decision=False
+    )
 
     promote_log_details = {
         "stable_branch": stable_branch,
@@ -755,7 +762,9 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
 
     if health_result.status == TestResultStatus.VERIFIED_PASS:
         update_promotion_status(conn, promotion.id, PromotionStatus.HEALTH_CHECK_PASSED)
-        transition_task(conn, task.id, TaskState.DONE, reason="health check post-promotion réussi")
+        transition_task(
+            conn, task.id, TaskState.DONE, reason="health check post-promotion réussi", is_human_decision=False
+        )
 
         health_check_details = {"total": health_result.total, "passed": health_result.passed}
         insert_audit_log(
@@ -797,7 +806,9 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
         # plus afficher PROMOTED, ce serait trompeur (l'état affiché ne
         # correspondrait plus à la réalité du dépôt).
         transition_task(
-            conn, task.id, TaskState.ROLLED_BACK, reason="AUTO_ROLLBACK: merge reverté après échec du health check"
+            conn, task.id, TaskState.ROLLED_BACK,
+            reason="AUTO_ROLLBACK: merge reverté après échec du health check",
+            is_human_decision=False,
         )
     # sinon (ROLLBACK_FAILED) : le merge est toujours en place, la tâche
     # reste PROMOTED — c'est l'état réel, intervention manuelle requise.

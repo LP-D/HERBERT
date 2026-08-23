@@ -136,13 +136,15 @@ def test_project_page_lists_tasks_with_sort_and_filter_js(db_conn, tmp_path):
     assert "hbInitFilter" in content
 
 
-def test_decisions_page_documents_known_limitation(db_conn, tmp_path):
+def test_decisions_page_documents_schema_guarantee(db_conn, tmp_path):
+    """V0.5 point 3 : la page ne prétend plus se fonder sur une heuristique
+    de `reason` — elle documente la garantie de schéma is_human_decision."""
     _seed(db_conn)
     build_dashboard(db_conn, tmp_path / "dashboard", tmp_path / "logs")
 
     content = (tmp_path / "dashboard" / "decisions.html").read_text(encoding="utf-8")
-    assert "Limite connue" in content
-    assert "--reason" in content
+    assert "is_human_decision" in content
+    assert "task status --to X" in content
 
 
 def test_empty_database_generates_dashboard_without_crashing(db_conn, tmp_path):

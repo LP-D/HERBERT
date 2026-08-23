@@ -1,28 +1,18 @@
 """Couche de données du dashboard V0.4 — LECTURE SEULE sur le SQLite
-existant. Aucune nouvelle table, aucune migration : uniquement des
-requêtes sur le schéma déjà en place (voir migrations/).
+existant, y compris les colonnes ajoutées par des migrations ultérieures
+(active_task_id/archived_at/is_human_decision, V0.5) : ce module lit le
+schéma tel qu'il existe, il ne le fait jamais évoluer lui-même.
 
-Limite connue et documentée (voir docs/DASHBOARD.md) : `state_transitions`
-n'a aucune colonne distinguant une transition déclenchée par un humain
-(`engine task status --to X`) d'une transition automatique
-(`advance_after_test_result`, `engine task promote`). `list_human_decisions`
-utilise donc une heuristique sur `reason` (exclut les libellés système fixes
-connus ET les lignes sans `reason`), pas une distinction garantie par le
-schéma — voir la docstring de cette fonction.
+`list_human_decisions` distingue une transition humaine d'une transition
+automatique via la colonne `is_human_decision` (garantie par le schéma
+depuis migrations/0007_is_human_decision.sql), plus une heuristique — voir
+la docstring de cette fonction pour la limite résiduelle sur l'historique
+pré-migration.
 """
 import json
 import sqlite3
 
 from app.state_machine.states import TaskState
-
-# Libellés `reason` générés par du code système (pas tapés par un humain) —
-# doivent rester synchronisés avec app/cli/main.py::cmd_task_promote. Aucune
-# source unique de vérité pour ces chaînes actuellement (limite connue).
-_SYSTEM_TRANSITION_REASONS = {
-    "merge de promotion réussi",
-    "health check post-promotion réussi",
-    "AUTO_ROLLBACK: merge reverté après échec du health check",
-}
 
 
 def list_projects_with_task_counts(conn: sqlite3.Connection, include_archived: bool = False) -> list[dict]:
@@ -94,28 +84,28 @@ def list_tasks_for_project(conn: sqlite3.Connection, project_id: str, include_ar
 
 
 def list_human_decisions(conn: sqlite3.Connection, limit: int = 200) -> list[dict]:
-    """Transitions d'état probablement déclenchées par un humain via
+    """Transitions d'état réellement déclenchées par un humain via
     `engine task status --to X --reason "..."`.
 
-    Heuristique, pas une distinction garantie par le schéma (voir docstring
-    du module) : exclut les lignes dont `reason` est NULL (indiscernables
-    des avancées automatiques de `advance_after_test_result`, qui utilisent
-    toujours reason=NULL) et les lignes dont `reason` correspond à un
-    libellé système fixe connu (`_SYSTEM_TRANSITION_REASONS`). Une décision
-    humaine prise SANS `--reason` n'apparaîtra donc pas ici — c'est une
-    conséquence directe de cette limite, pas un bug de la requête.
+    Garanti par le schéma depuis V0.5 (migrations/0007_is_human_decision.sql,
+    colonne is_human_decision) — plus une heuristique déduite de `reason`.
+    Déterminé au moment de chaque transition par l'appelant réel de
+    transition_task() (voir app/state_machine/service.py), pas deviné après
+    coup. Limite résiduelle, honnête : les lignes créées AVANT cette
+    migration ont is_human_decision=0 par convention rétroactive (voir le
+    commentaire de la migration), pas une vérification transition par
+    transition de l'historique pré-existant.
     """
-    placeholders = ",".join("?" for _ in _SYSTEM_TRANSITION_REASONS)
     rows = conn.execute(
-        f"""SELECT st.id, st.task_id, st.from_state, st.to_state, st.allowed, st.reason, st.created_at,
-                   t.description AS task_description, t.project_id, p.name AS project_name
-            FROM state_transitions st
-            JOIN tasks t ON t.id = st.task_id
-            JOIN projects p ON p.id = t.project_id
-            WHERE st.reason IS NOT NULL AND st.reason NOT IN ({placeholders})
-            ORDER BY st.created_at DESC
-            LIMIT ?""",
-        (*_SYSTEM_TRANSITION_REASONS, limit),
+        """SELECT st.id, st.task_id, st.from_state, st.to_state, st.allowed, st.reason, st.created_at,
+                  t.description AS task_description, t.project_id, p.name AS project_name
+           FROM state_transitions st
+           JOIN tasks t ON t.id = st.task_id
+           JOIN projects p ON p.id = t.project_id
+           WHERE st.is_human_decision = 1
+           ORDER BY st.created_at DESC
+           LIMIT ?""",
+        (limit,),
     ).fetchall()
     return [
         {

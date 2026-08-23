@@ -148,21 +148,22 @@ qu'au contact de vraies données ou d'un vrai navigateur :
   serveur, pas de watch) — si les données SQLite changent par un autre biais
   (édition manuelle de la DB, restauration d'un snapshot), relancer
   `engine dashboard build`.
-- **« Décisions humaines » : heuristique, pas une garantie du schéma.**
-  `state_transitions` n'a aucune colonne distinguant une transition
-  déclenchée par un humain (`engine task status --to X --reason "..."`)
-  d'une transition automatique (`advance_after_test_result`,
-  `engine task promote`). Sans migration (explicitement exclue du périmètre
-  de cette fonctionnalité — voir `app/reporting/dashboard_data.py`),
-  `decisions.html` affiche les transitions dont la `reason` n'est ni vide ni
-  l'un des 3 libellés système fixes connus (`merge de promotion réussi`,
-  `health check post-promotion réussi`, `AUTO_ROLLBACK: ...`). **Une
-  décision humaine prise sans `--reason` n'apparaît donc PAS ici** —
-  indiscernable des avancées automatiques, qui utilisent aussi `reason=NULL`.
-  Passer systématiquement `--reason` à `engine task status` est le seul
-  moyen de garantir qu'une décision humaine soit tracée sur cette page.
-  Documenté aussi dans le code (`_SYSTEM_TRANSITION_REASONS`) et affiché
-  directement sur la page elle-même (pas une note cachée).
+- **« Décisions humaines » : garanti par le schéma depuis V0.5, plus une
+  heuristique.** `state_transitions.is_human_decision`
+  (migrations/0007_is_human_decision.sql) est peuplée au moment de chaque
+  transition par l'appelant réel de `transition_task()` — `True` seulement
+  pour `engine task status --to X` (le seul site d'appel humain de tout le
+  code), `False` pour toute transition automatique
+  (`advance_after_test_result`, `engine task promote`). `decisions.html`
+  filtre désormais sur cette colonne, pas sur la présence de `--reason` :
+  **une décision humaine prise sans `--reason` apparaît maintenant
+  correctement sur cette page**, ce qui n'était pas le cas avec
+  l'heuristique V0.4.
+  Limite résiduelle, honnête : les transitions créées **avant** cette
+  migration ont `is_human_decision=0` par convention rétroactive (voir le
+  commentaire de la migration) — le passé n'a pas été ré-analysé transition
+  par transition, ce serait réintroduire une heuristique déguisée en
+  garantie de schéma.
 - **`audit.html` tronque les `details` volumineux.** Constaté sur données
   réelles (session de développement) : certaines entrées `audit_log`
   contiennent jusqu'à 41 Ko de texte brut (sortie d'outil capturée par le

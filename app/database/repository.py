@@ -142,8 +142,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, archived_at: str) -> No
 
 def insert_state_transition(conn: sqlite3.Connection, transition: StateTransition) -> None:
     conn.execute(
-        """INSERT INTO state_transitions (id, task_id, from_state, to_state, allowed, reason, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO state_transitions
+           (id, task_id, from_state, to_state, allowed, reason, is_human_decision, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             transition.id,
             transition.task_id,
@@ -151,6 +152,7 @@ def insert_state_transition(conn: sqlite3.Connection, transition: StateTransitio
             transition.to_state.value,
             int(transition.allowed),
             transition.reason,
+            int(transition.is_human_decision),
             transition.created_at.isoformat(),
         ),
     )

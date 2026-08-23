@@ -432,14 +432,14 @@ def _build_decisions_html(decisions: list[dict]) -> str:
     <h1>Décisions humaines</h1>
     <div class="hb-details" style="margin-bottom:1rem;">
       <details class="hb-details">
-        <summary>Limite connue de cette page (cliquer pour lire)</summary>
+        <summary>À propos de cette page (cliquer pour lire)</summary>
         <div class="hb-details-body">
-          Le schéma SQLite actuel ne distingue pas une transition déclenchée par un
-          humain (<code>engine task status --to X --reason "..."</code>) d'une transition
-          automatique. Cette page affiche les transitions dont la <code>reason</code>
-          n'est ni vide ni un libellé système connu — une décision humaine prise
-          <strong>sans</strong> <code>--reason</code> n'apparaît donc pas ici.
-          Voir docs/DASHBOARD.md.
+          Une transition apparaît ici si elle a été déclenchée directement par un humain
+          via <code>engine task status --to X</code> — garanti par le schéma
+          (colonne <code>is_human_decision</code>), pas déduit de la présence d'un
+          <code>--reason</code>. Limite résiduelle : les transitions créées avant
+          l'introduction de cette colonne sont classées automatiques par convention
+          rétroactive, pas vérifiées une par une. Voir docs/DASHBOARD.md.
         </div>
       </details>
     </div>
