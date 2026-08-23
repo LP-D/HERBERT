@@ -13,3 +13,10 @@ venv/
 .claude/scheduled_tasks.lock
 graphify-out/
 reports/
+dashboard/
+
+# Outillage de conception Phase 0 (V0.4 dashboard) — dev-time uniquement,
+# jamais une dépendance du produit livré, voir docs/DASHBOARD.md.
+.claude/skills/
+.agents/
+skills-lock.json

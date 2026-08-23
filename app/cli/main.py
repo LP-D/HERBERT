@@ -47,6 +47,7 @@ from app.git_wrapper import (  # noqa: E402
     rollback_to_commit,
 )
 from app.pytest_runner import run_pytest_for_project  # noqa: E402
+from app.reporting.dashboard_builder import build_dashboard, open_dashboard  # noqa: E402
 from app.state_machine import TaskState, is_legal_transition  # noqa: E402
 from app.state_machine.service import TaskNotFoundError, advance_after_test_result, transition_task  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
@@ -68,6 +69,31 @@ def _connect() -> sqlite3.Connection:
 def _logs_dir() -> Path:
     config = load_config(_config_path())
     return REPO_ROOT / config["logs"]["dir"]
+
+
+def _regenerate_dashboard(conn: sqlite3.Connection) -> None:
+    """Best-effort : reconstruit dashboard/ après toute commande qui modifie
+    l'état d'une tâche. Assouplissement DÉLIBÉRÉ et documenté du principe
+    "aucun sous-effet automatique" appliqué à `engine sync push` (voir
+    docs/DASHBOARD.md) : régénérer un fichier HTML local est sans risque —
+    pas d'effet externe, pas d'irréversibilité — contrairement à un push
+    vers un dépôt distant. Ne doit JAMAIS faire échouer ni bloquer la
+    commande CLI appelante : toute exception ici est avalée et journalisée
+    avec un statut UNAVAILABLE, jamais propagée."""
+    try:
+        build_dashboard(conn, REPO_ROOT / "dashboard", _logs_dir())
+    except Exception as exc:
+        try:
+            append_jsonl_event(
+                _logs_dir(),
+                component="cli.dashboard_auto_regen",
+                event="régénération automatique du dashboard échouée",
+                level="WARNING",
+                status=LogStatus.UNAVAILABLE.value,
+                details={"error": str(exc)},
+            )
+        except Exception:
+            pass  # journalisation elle-même best-effort : ne jamais lever ici
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -189,6 +215,7 @@ def cmd_task_create(args: argparse.Namespace) -> int:
 
     insert_task(conn, task)
     stored = get_task(conn, task.id)
+    _regenerate_dashboard(conn)
     conn.close()
 
     if stored is None:
@@ -254,6 +281,7 @@ def cmd_task_status(args: argparse.Namespace) -> int:
         conn.close()
         print(f"[FAILED] {exc}")
         return 1
+    _regenerate_dashboard(conn)
     conn.close()
 
     if allowed:
@@ -317,6 +345,7 @@ def cmd_task_branch(args: argparse.Namespace) -> int:
             "stderr": result.stderr,
         },
     )
+    _regenerate_dashboard(conn)
     conn.close()
 
     if not result.ok:
@@ -362,6 +391,7 @@ def cmd_task_rollback(args: argparse.Namespace) -> int:
         task_id=task.id,
         details={"base_commit": base_commit, "stdout": result.stdout, "stderr": result.stderr},
     )
+    _regenerate_dashboard(conn)
     conn.close()
 
     if not result.ok:
@@ -430,6 +460,7 @@ def cmd_task_test(args: argparse.Namespace) -> int:
             "regressions": regressions,
         },
     )
+    _regenerate_dashboard(conn)
     conn.close()
 
     print(
@@ -524,6 +555,7 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
                 status=PromotionStatus.MERGE_FAILED,
             ),
         )
+        _regenerate_dashboard(conn)
         conn.close()
         print(f"[FAILED] merge échoué: {merge_result.stderr}")
         return 1
@@ -596,6 +628,7 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
             task_id=task.id,
             details=health_check_details,
         )
+        _regenerate_dashboard(conn)
         conn.close()
         print(f"[VERIFIED] health check post-promotion réussi ({health_result.passed}/{health_result.total}) — tâche DONE.")
         return 0
@@ -647,6 +680,7 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
         task_id=task.id,
         details=auto_rollback_details,
     )
+    _regenerate_dashboard(conn)
     conn.close()
 
     print(
@@ -676,6 +710,35 @@ def cmd_report(args: argparse.Namespace) -> int:
     conn.close()
 
     print(f"[VERIFIED] rapport généré: {output_path}")
+    return 0
+
+
+def cmd_dashboard_build(args: argparse.Namespace) -> int:
+    """engine dashboard build : régénère TOUT dashboard/ depuis SQLite
+    (écrase le contenu existant, ne l'accumule pas). Reste disponible en
+    commande manuelle pour une régénération à la demande (ex. après
+    restauration d'un snapshot, ou pour forcer un rafraîchissement) — en
+    plus de la régénération automatique déclenchée par les commandes task
+    (voir _regenerate_dashboard)."""
+    conn = _connect()
+    result = build_dashboard(conn, REPO_ROOT / "dashboard", _logs_dir())
+    conn.close()
+
+    index_path = REPO_ROOT / "dashboard" / "index.html"
+    print(f"[VERIFIED] dashboard régénéré: {len(result['pages'])} page(s), {len(result['assets'])} asset(s) — {index_path}")
+    return 0
+
+
+def cmd_dashboard_open(args: argparse.Namespace) -> int:
+    """engine dashboard open : ouvre dashboard/index.html via le module
+    stdlib `webbrowser` — aucun serveur, aucun port."""
+    index_path = REPO_ROOT / "dashboard" / "index.html"
+    if not index_path.exists():
+        print("[FAILED] dashboard/index.html introuvable — lancez d'abord `engine dashboard build`.")
+        return 1
+
+    open_dashboard(REPO_ROOT / "dashboard")
+    print(f"[VERIFIED] dashboard ouvert dans le navigateur par défaut: {index_path}")
     return 0
 
 
@@ -793,6 +856,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report_parser.add_argument("task_id")
     report_parser.set_defaults(func=cmd_report)
+
+    dashboard_parser = subparsers.add_parser("dashboard", help="dashboard HTML statique local (V0.4, lecture seule)")
+    dashboard_sub = dashboard_parser.add_subparsers(dest="dashboard_command", required=True)
+
+    dashboard_build = dashboard_sub.add_parser(
+        "build", help="régénère dashboard/ depuis SQLite (écrase, ne l'accumule pas)"
+    )
+    dashboard_build.set_defaults(func=cmd_dashboard_build)
+
+    dashboard_open = dashboard_sub.add_parser(
+        "open", help="ouvre dashboard/index.html dans le navigateur (webbrowser, aucun serveur)"
+    )
+    dashboard_open.set_defaults(func=cmd_dashboard_open)
 
     sync_parser = subparsers.add_parser("sync", help="synchronisation avec le remote (push explicite uniquement)")
     sync_sub = sync_parser.add_subparsers(dest="sync_command", required=True)
