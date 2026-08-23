@@ -14,6 +14,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from app.active_task import resolve_active_task_id_for_hook  # noqa: E402
 from app.config import load_config  # noqa: E402
 from app.database.connection import get_connection  # noqa: E402
 from app.database.migrate import apply_migrations  # noqa: E402
@@ -43,6 +44,9 @@ def handle_event(event: dict) -> dict:
     tool_name = event.get("tool_name", "") or "unknown"
     tool_input = event.get("tool_input", {}) or {}
     tool_response = event.get("tool_response", {}) or {}
+    # Même fallback que pre_tool_use.py (V0.5) : Claude Code n'envoie
+    # jamais task_id, résolu ci-dessous via la "tâche active" du projet
+    # une fois `conn` disponible — voir app/active_task.py.
     task_id = event.get("task_id")
 
     is_error = bool(isinstance(tool_response, dict) and tool_response.get("is_error"))
@@ -59,6 +63,8 @@ def handle_event(event: dict) -> dict:
     config = _load_config()
 
     conn = _get_db_conn(config)
+    if task_id is None:
+        task_id = resolve_active_task_id_for_hook(conn, event.get("cwd"))
     insert_audit_log(
         conn,
         component="hook.post_tool_use",

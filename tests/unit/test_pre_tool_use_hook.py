@@ -335,3 +335,70 @@ def test_pre_tool_use_allows_write_tool_to_other_settings_json_nested_elsewhere(
     }
     exit_code, message = pre_tool_use_module.handle_event(event)
     assert exit_code == 0, f"écrire un settings.json différent ne doit pas être bloqué: {message}"
+
+
+def test_pre_tool_use_attributes_task_id_from_active_task(pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch):
+    """V0.5 point 1 : Claude Code n'envoie jamais task_id — le hook doit le
+    résoudre depuis la "tâche active" du projet correspondant à `cwd`."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+
+    from app.active_task import activate_task
+    from app.database.repository import insert_project, insert_task
+    from app.models import Project, Task
+
+    project_dir = tmp_path / "projet-hook-actif"
+    project_dir.mkdir()
+
+    conn = get_connection(isolated_repo_root / "data" / "herbert.db")
+    from app.database.migrate import apply_migrations
+    apply_migrations(conn, isolated_repo_root / "migrations")
+    project = Project(name="projet-hook-actif", path=str(project_dir))
+    insert_project(conn, project)
+    task = Task(project_id=project.id, description="tâche active pour le hook")
+    insert_task(conn, task)
+    activate_task(conn, task.id)
+    conn.close()
+
+    event = {
+        "tool_name": "Bash",
+        "cwd": str(project_dir),
+        "tool_input": {"command": "git status"},
+        # PAS de task_id ici — exactement ce que Claude Code envoie réellement.
+    }
+    exit_code, _message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 0
+
+    conn = get_connection(isolated_repo_root / "data" / "herbert.db")
+    row = conn.execute(
+        "SELECT task_id FROM commands WHERE command = 'git status' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    assert row["task_id"] == task.id
+
+
+def test_pre_tool_use_no_active_task_keeps_task_id_none(pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch):
+    """Comportement préservé quand aucune tâche n'est active (ou le projet
+    n'est pas enregistré) : jamais bloquant, task_id reste NULL comme avant
+    cette fonctionnalité."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    unrelated_dir = tmp_path / "jamais-enregistre"
+    unrelated_dir.mkdir()
+
+    event = {
+        "tool_name": "Bash",
+        "cwd": str(unrelated_dir),
+        "tool_input": {"command": "git status"},
+    }
+    exit_code, _message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 0
+
+    conn = get_connection(isolated_repo_root / "data" / "herbert.db")
+    row = conn.execute(
+        "SELECT task_id FROM commands WHERE command = 'git status' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    assert row["task_id"] is None

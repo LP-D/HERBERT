@@ -75,3 +75,40 @@ def test_post_tool_use_logs_failure_in_audit_log(post_tool_use_module, isolated_
 def test_post_tool_use_main_never_blocks_on_invalid_json(post_tool_use_module):
     exit_code = post_tool_use_module.main(["not valid json"])
     assert exit_code == 0
+
+
+def test_post_tool_use_attributes_task_id_from_active_task(post_tool_use_module, isolated_repo_root, tmp_path, monkeypatch):
+    """V0.5 point 1 : même résolution que côté PreToolUse, pour audit_log."""
+    monkeypatch.setattr(post_tool_use_module, "REPO_ROOT", isolated_repo_root)
+
+    from app.active_task import activate_task
+
+    project_dir = tmp_path / "projet-post-hook-actif"
+    project_dir.mkdir()
+
+    conn = get_connection(isolated_repo_root / "data" / "herbert.db")
+    apply_migrations(conn, isolated_repo_root / "migrations")
+    project = Project(name="projet-post-hook-actif", path=str(project_dir))
+    insert_project(conn, project)
+    task = Task(project_id=project.id, description="tâche active pour post_tool_use")
+    insert_task(conn, task)
+    activate_task(conn, task.id)
+    conn.close()
+
+    event = {
+        "tool_name": "Bash",
+        "cwd": str(project_dir),
+        "tool_input": {"command": "git status"},
+        "tool_response": {"is_error": False},
+        # PAS de task_id — exactement ce que Claude Code envoie réellement.
+    }
+    result = post_tool_use_module.handle_event(event)
+    assert result["status"] == "VERIFIED"
+
+    conn = get_connection(isolated_repo_root / "data" / "herbert.db")
+    row = conn.execute(
+        "SELECT task_id FROM audit_log WHERE component = 'hook.post_tool_use' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    assert row["task_id"] == task.id

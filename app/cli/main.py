@@ -6,6 +6,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from app.active_task import activate_task, deactivate_task, deactivate_task_if_active  # noqa: E402
 from app.change_proof_builder import build_change_proof, detect_regressions  # noqa: E402
 from app.cli.doctor import run_all_checks  # noqa: E402
 from app.config import load_config, write_default_config  # noqa: E402
@@ -295,6 +296,50 @@ def cmd_task_status(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_task_activate(args: argparse.Namespace) -> int:
+    """engine task activate <task_id> : active cette tâche pour son projet
+    (résolu automatiquement) — les hooks PreToolUse/PostToolUse attribuent
+    alors task_id aux commandes/événements réels tant qu'elle reste active.
+    Voir app/active_task.py pour le mécanisme complet et ses limites."""
+    conn = _connect()
+    try:
+        result = activate_task(conn, args.task_id)
+    except ValueError as exc:
+        conn.close()
+        print(f"[FAILED] {exc}")
+        return 1
+    conn.close()
+
+    if result.previous_task_id and result.previous_task_id != result.task.id:
+        print(
+            f"[VERIFIED] tâche active remplacée sur le projet {result.project.name}: "
+            f"{result.previous_task_id} -> {result.task.id}"
+        )
+    else:
+        print(f"[VERIFIED] tâche active sur le projet {result.project.name}: {result.task.id}")
+    return 0
+
+
+def cmd_task_deactivate(args: argparse.Namespace) -> int:
+    """engine task deactivate <task_id> : ne désactive QUE si cette tâche
+    est bien la tâche active de son projet — jamais un no-op silencieux."""
+    conn = _connect()
+    try:
+        cleared = deactivate_task(conn, args.task_id)
+    except ValueError as exc:
+        conn.close()
+        print(f"[FAILED] {exc}")
+        return 1
+    conn.close()
+
+    if cleared:
+        print(f"[VERIFIED] tâche désactivée: {args.task_id}")
+        return 0
+
+    print(f"[FAILED] cette tâche n'était pas la tâche active de son projet, rien désactivé: {args.task_id}")
+    return 1
+
+
 def _get_task_and_project(conn: sqlite3.Connection, task_id: str) -> tuple[Task | None, Project | None, str | None]:
     """Retourne (task, project, message_erreur). message_erreur est None si
     tout s'est bien passé."""
@@ -391,6 +436,13 @@ def cmd_task_rollback(args: argparse.Namespace) -> int:
         task_id=task.id,
         details={"base_commit": base_commit, "stdout": result.stdout, "stderr": result.stderr},
     )
+    if result.ok:
+        # Rollback manuel réellement effectué : le travail de cette tâche
+        # sur cette candidate est terminé, plus rien à attribuer après ce
+        # point — désactivation automatique (best-effort, voir
+        # app/active_task.py). Pas de désactivation si le rollback a
+        # échoué : le travail (et donc l'attribution de commandes) continue.
+        deactivate_task_if_active(conn, task.id)
     _regenerate_dashboard(conn)
     conn.close()
 
@@ -628,6 +680,12 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
             task_id=task.id,
             details=health_check_details,
         )
+        # Health check post-promotion réussi : le cycle de vie de cette
+        # tâche est réellement terminé, plus rien à attribuer après ce
+        # point (distinct du DONE normal après `task test`, qui ne
+        # désactive PAS puisque le travail continue généralement vers
+        # `task promote`) — voir app/active_task.py.
+        deactivate_task_if_active(conn, task.id)
         _regenerate_dashboard(conn)
         conn.close()
         print(f"[VERIFIED] health check post-promotion réussi ({health_result.passed}/{health_result.total}) — tâche DONE.")
@@ -680,6 +738,12 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
         task_id=task.id,
         details=auto_rollback_details,
     )
+    if revert_result.ok:
+        # AUTO_ROLLBACK réellement effectué (tâche réellement ROLLED_BACK,
+        # état terminal) : désactivation automatique. Pas si le revert
+        # lui-même a échoué (ROLLBACK_FAILED) — la tâche reste PROMOTED,
+        # intervention manuelle requise, le travail n'est pas terminé.
+        deactivate_task_if_active(conn, task.id)
     _regenerate_dashboard(conn)
     conn.close()
 
@@ -830,6 +894,16 @@ def build_parser() -> argparse.ArgumentParser:
     task_status.add_argument("--to", required=False, default=None, help="nouvel état souhaité (optionnel)")
     task_status.add_argument("--reason", required=False, default=None)
     task_status.set_defaults(func=cmd_task_status)
+
+    task_activate = task_sub.add_parser(
+        "activate", help="active une tâche pour son projet (attribution task_id aux commandes des hooks)"
+    )
+    task_activate.add_argument("task_id")
+    task_activate.set_defaults(func=cmd_task_activate)
+
+    task_deactivate = task_sub.add_parser("deactivate", help="désactive une tâche active")
+    task_deactivate.add_argument("task_id")
+    task_deactivate.set_defaults(func=cmd_task_deactivate)
 
     task_branch = task_sub.add_parser("branch", help="crée/checkout candidate/<task_id> dans le projet lié")
     task_branch.add_argument("task_id")

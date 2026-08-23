@@ -23,6 +23,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from app.active_task import resolve_active_task_id_for_hook  # noqa: E402
 from app.config import load_config  # noqa: E402
 from app.database.connection import get_connection  # noqa: E402
 from app.database.migrate import apply_migrations  # noqa: E402
@@ -202,6 +203,11 @@ def handle_event(event: dict) -> tuple[int, str]:
     # REPO_ROOT, qui n'est que l'emplacement de ce script et peut être
     # partagé entre plusieurs projets (voir docstring du module).
     project_root = event.get("cwd") or str(REPO_ROOT)
+    # Claude Code n'envoie jamais task_id (aucune notion de "tâche
+    # HERBERT") — event.get("task_id") reste ici en fallback si une
+    # future version le fait un jour, mais en pratique la résolution
+    # réelle se fait via `active_task` (V0.5) une fois `conn` disponible
+    # ci-dessous : voir app/active_task.py.
     task_id = event.get("task_id")
 
     decision, reason = (
@@ -230,6 +236,8 @@ def handle_event(event: dict) -> tuple[int, str]:
     try:
         config = _load_config()
         conn = _get_db_conn(config)
+        if task_id is None:
+            task_id = resolve_active_task_id_for_hook(conn, event.get("cwd"))
         insert_command_log(
             conn,
             CommandLogEntry(
