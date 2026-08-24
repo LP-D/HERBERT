@@ -377,7 +377,7 @@ def cmd_task_activate(args: argparse.Namespace) -> int:
     Voir app/active_task.py pour le mécanisme complet et ses limites."""
     conn = _connect()
     try:
-        result = activate_task(conn, args.task_id)
+        result = activate_task(conn, args.task_id, _logs_dir())
     except ValueError as exc:
         conn.close()
         print(f"[FAILED] {exc}")
@@ -399,7 +399,7 @@ def cmd_task_deactivate(args: argparse.Namespace) -> int:
     est bien la tâche active de son projet — jamais un no-op silencieux."""
     conn = _connect()
     try:
-        cleared = deactivate_task(conn, args.task_id)
+        cleared = deactivate_task(conn, args.task_id, _logs_dir())
     except ValueError as exc:
         conn.close()
         print(f"[FAILED] {exc}")
@@ -433,7 +433,7 @@ def cmd_task_archive(args: argparse.Namespace) -> int:
 
     archived_at = datetime.now(timezone.utc).isoformat()
     archive_task(conn, task.id, archived_at)
-    deactivate_task_if_active(conn, task.id)
+    deactivate_task_if_active(conn, task.id, _logs_dir(), trigger="archive")
     _regenerate_dashboard(conn)
     conn.close()
 
@@ -543,7 +543,7 @@ def cmd_task_rollback(args: argparse.Namespace) -> int:
         # point — désactivation automatique (best-effort, voir
         # app/active_task.py). Pas de désactivation si le rollback a
         # échoué : le travail (et donc l'attribution de commandes) continue.
-        deactivate_task_if_active(conn, task.id)
+        deactivate_task_if_active(conn, task.id, _logs_dir(), trigger="manual_rollback")
     _regenerate_dashboard(conn)
     conn.close()
 
@@ -790,7 +790,7 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
         # point (distinct du DONE normal après `task test`, qui ne
         # désactive PAS puisque le travail continue généralement vers
         # `task promote`) — voir app/active_task.py.
-        deactivate_task_if_active(conn, task.id)
+        deactivate_task_if_active(conn, task.id, _logs_dir(), trigger="promote_health_check_passed")
         _regenerate_dashboard(conn)
         conn.close()
         print(f"[VERIFIED] health check post-promotion réussi ({health_result.passed}/{health_result.total}) — tâche DONE.")
@@ -850,7 +850,7 @@ def cmd_task_promote(args: argparse.Namespace) -> int:
         # état terminal) : désactivation automatique. Pas si le revert
         # lui-même a échoué (ROLLBACK_FAILED) — la tâche reste PROMOTED,
         # intervention manuelle requise, le travail n'est pas terminé.
-        deactivate_task_if_active(conn, task.id)
+        deactivate_task_if_active(conn, task.id, _logs_dir(), trigger="auto_rollback")
     _regenerate_dashboard(conn)
     conn.close()
 

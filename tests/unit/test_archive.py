@@ -190,7 +190,7 @@ def test_cmd_task_archive_deactivates_if_it_was_active(isolated_repo_root, tmp_p
     task, project = _make_task(isolated_repo_root, project_dir)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    activate_task(conn, task.id)
+    activate_task(conn, task.id, isolated_repo_root / "logs")
     assert get_active_task_id(conn, project.id) == task.id
     conn.close()
 

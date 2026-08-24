@@ -356,7 +356,7 @@ def test_pre_tool_use_attributes_task_id_from_active_task(pre_tool_use_module, i
     insert_project(conn, project)
     task = Task(project_id=project.id, description="tâche active pour le hook")
     insert_task(conn, task)
-    activate_task(conn, task.id)
+    activate_task(conn, task.id, isolated_repo_root / "logs")
     conn.close()
 
     event = {

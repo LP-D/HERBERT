@@ -29,7 +29,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.database.repository import get_project, get_task, list_projects
+from app.logging_utils import append_jsonl_event
 from app.models import Project, Task
+from app.models.enums import LogStatus
+from app.state_machine.states import TaskState
+
+# États pour lesquels activer une tâche n'a plus de sens : le travail actif
+# attribuable à des commandes est terminé. DONE reste théoriquement légal
+# vers PROMOTED (LEGAL_TRANSITIONS), mais la suite (`task promote`) est
+# exécutée par HERBERT lui-même, pas par des commandes humaines à attribuer
+# — l'activer n'aurait aucun effet utile. PROMOTED est inclus pour un cas
+# réel, pas hypothétique : si le revert d'un AUTO_ROLLBACK échoue lui-même
+# (ROLLBACK_FAILED, voir cmd_task_promote), la tâche reste bloquée à
+# PROMOTED indéfiniment jusqu'à intervention manuelle — un état de repos
+# durable, pas transitoire, dans ce cas précis.
+_NON_ACTIVATABLE_STATES = {TaskState.DONE, TaskState.PROMOTED, TaskState.ROLLED_BACK}
 
 
 @dataclass
@@ -84,15 +98,29 @@ def resolve_active_task_id_for_hook(conn: sqlite3.Connection, cwd: str | None) -
         return None
 
 
-def activate_task(conn: sqlite3.Connection, task_id: str) -> ActivationResult:
+def activate_task(conn: sqlite3.Connection, task_id: str, logs_dir: str | Path) -> ActivationResult:
     """`engine task activate <task_id>` : active cette tâche pour SON
     projet (résolu depuis task.project_id, jamais besoin de le préciser).
     Écrase l'activation précédente du même projet si elle existe —
     silencieusement en base, mais `previous_task_id` est retourné pour que
-    l'appelant (CLI) l'affiche : jamais une bascule cachée."""
+    l'appelant (CLI) l'affiche : jamais une bascule cachée.
+
+    Refuse (ValueError) si la tâche est dans un état terminal pour ce
+    concept (voir _NON_ACTIVATABLE_STATES) : activer une tâche déjà
+    DONE/PROMOTED/ROLLED_BACK n'attribuerait des commandes à rien d'utile.
+
+    `logs_dir` est obligatoire, pas une valeur par défaut cachée : chaque
+    activation/désactivation est journalisée dans logs/*.jsonl (composant
+    `active_task`) — traçabilité de la DÉCISION d'attribution, pas
+    seulement de son effet en base."""
     task = get_task(conn, task_id)
     if task is None:
         raise ValueError(f"tâche introuvable: {task_id}")
+    if task.status in _NON_ACTIVATABLE_STATES:
+        raise ValueError(
+            f"impossible d'activer une tâche à l'état {task.status.value} "
+            "(plus rien à attribuer : ce cycle de vie est terminé, créez une nouvelle tâche si le travail reprend)"
+        )
     project = get_project(conn, task.project_id)
     if project is None:
         raise ValueError(f"projet introuvable pour cette tâche (project_id={task.project_id})")
@@ -105,14 +133,32 @@ def activate_task(conn: sqlite3.Connection, task_id: str) -> ActivationResult:
     )
     conn.commit()
 
+    append_jsonl_event(
+        logs_dir,
+        component="active_task",
+        event="tâche activée",
+        level="INFO",
+        status=LogStatus.VERIFIED.value,
+        task_id=task.id,
+        details={
+            "project_id": project.id,
+            "project_name": project.name,
+            "previous_task_id": previous_task_id,
+            "trigger": "manual",
+        },
+    )
+
     return ActivationResult(project=project, task=task, previous_task_id=previous_task_id)
 
 
-def deactivate_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """`engine task deactivate <task_id>` : ne désactive QUE si ce task_id
-    est bien la tâche active de son projet — jamais un no-op silencieux
-    fondé sur une mauvaise supposition. Retourne True si une désactivation
-    a réellement eu lieu."""
+def deactivate_task(conn: sqlite3.Connection, task_id: str, logs_dir: str | Path, trigger: str = "manual") -> bool:
+    """`engine task deactivate <task_id>` (trigger="manual" par défaut) : ne
+    désactive QUE si ce task_id est bien la tâche active de son projet —
+    jamais un no-op silencieux fondé sur une mauvaise supposition. Retourne
+    True si une désactivation a réellement eu lieu (et alors seulement,
+    journalisée dans logs/*.jsonl avec le `trigger` fourni — "manual" pour
+    `engine task deactivate`, une valeur distincte pour chacun des 3 points
+    de sortie automatiques, voir deactivate_task_if_active)."""
     task = get_task(conn, task_id)
     if task is None:
         raise ValueError(f"tâche introuvable: {task_id}")
@@ -128,16 +174,31 @@ def deactivate_task(conn: sqlite3.Connection, task_id: str) -> bool:
         (project.id,),
     )
     conn.commit()
+
+    append_jsonl_event(
+        logs_dir,
+        component="active_task",
+        event="tâche désactivée",
+        level="INFO",
+        status=LogStatus.VERIFIED.value,
+        task_id=task.id,
+        details={"project_id": project.id, "project_name": project.name, "trigger": trigger},
+    )
     return True
 
 
-def deactivate_task_if_active(conn: sqlite3.Connection, task_id: str) -> None:
-    """Désactivation AUTOMATIQUE — utilisée aux 3 points de sortie
+def deactivate_task_if_active(conn: sqlite3.Connection, task_id: str, logs_dir: str | Path, trigger: str) -> None:
+    """Désactivation AUTOMATIQUE — utilisée aux 4 points de sortie
     réellement terminaux du cycle de vie d'une tâche (health check
-    post-promotion réussi, AUTO_ROLLBACK, rollback manuel). Best-effort :
-    ne doit JAMAIS faire échouer la commande CLI qui l'appelle, même si la
-    tâche/le projet ont disparu entre-temps."""
+    post-promotion réussi, AUTO_ROLLBACK, rollback manuel, archivage).
+    `trigger` identifie LEQUEL dans le détail journalisé (ex.
+    "promote_health_check_passed", "auto_rollback", "manual_rollback",
+    "archive") — distinction humain/système du même esprit que le point 3
+    (is_human_decision), appliquée ici à l'attribution plutôt qu'aux
+    transitions d'état. Best-effort : ne doit JAMAIS faire échouer la
+    commande CLI qui l'appelle, même si la tâche/le projet ont disparu
+    entre-temps, ou si la journalisation elle-même échoue."""
     try:
-        deactivate_task(conn, task_id)
+        deactivate_task(conn, task_id, logs_dir, trigger=trigger)
     except Exception:
         pass

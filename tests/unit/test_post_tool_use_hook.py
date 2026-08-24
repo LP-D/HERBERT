@@ -92,7 +92,7 @@ def test_post_tool_use_attributes_task_id_from_active_task(post_tool_use_module,
     insert_project(conn, project)
     task = Task(project_id=project.id, description="tâche active pour post_tool_use")
     insert_task(conn, task)
-    activate_task(conn, task.id)
+    activate_task(conn, task.id, isolated_repo_root / "logs")
     conn.close()
 
     event = {

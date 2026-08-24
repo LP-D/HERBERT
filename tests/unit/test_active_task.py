@@ -10,6 +10,7 @@ from app.active_task import (
 )
 from app.database.repository import insert_project, insert_task
 from app.models import Project, Task
+from app.state_machine.states import TaskState
 
 
 def _make_project_and_task(conn, project_name="projet-actif", path="C:/projet-actif", description="tâche"):
@@ -45,10 +46,10 @@ def test_get_active_task_id_none_by_default(db_conn):
     assert get_active_task_id(db_conn, project.id) is None
 
 
-def test_activate_task_sets_active_task_id(db_conn):
+def test_activate_task_sets_active_task_id(db_conn, tmp_path):
     project, task = _make_project_and_task(db_conn)
 
-    result = activate_task(db_conn, task.id)
+    result = activate_task(db_conn, task.id, tmp_path / "logs")
 
     assert result.project.id == project.id
     assert result.task.id == task.id
@@ -56,7 +57,7 @@ def test_activate_task_sets_active_task_id(db_conn):
     assert get_active_task_id(db_conn, project.id) == task.id
 
 
-def test_activate_task_overwrites_previous_and_reports_it(db_conn):
+def test_activate_task_overwrites_previous_and_reports_it(db_conn, tmp_path):
     project = Project(name="projet-double", path="C:/projet-double")
     insert_project(db_conn, project)
     task_a = Task(project_id=project.id, description="tâche A")
@@ -64,47 +65,134 @@ def test_activate_task_overwrites_previous_and_reports_it(db_conn):
     insert_task(db_conn, task_a)
     insert_task(db_conn, task_b)
 
-    activate_task(db_conn, task_a.id)
-    result = activate_task(db_conn, task_b.id)
+    activate_task(db_conn, task_a.id, tmp_path / "logs")
+    result = activate_task(db_conn, task_b.id, tmp_path / "logs")
 
     assert result.previous_task_id == task_a.id
     assert get_active_task_id(db_conn, project.id) == task_b.id
 
 
-def test_activate_task_unknown_task_raises(db_conn):
+def test_activate_task_unknown_task_raises(db_conn, tmp_path):
     with pytest.raises(ValueError, match="introuvable"):
-        activate_task(db_conn, "inexistant")
+        activate_task(db_conn, "inexistant", tmp_path / "logs")
 
 
-def test_deactivate_task_clears_when_matching(db_conn):
+def test_activate_task_refuses_terminal_states(db_conn, tmp_path):
+    """Garde d'état : activer une tâche DONE/PROMOTED/ROLLED_BACK est refusé
+    avec un message clair, jamais silencieusement accepté."""
+    project = Project(name="projet-terminal", path="C:/projet-terminal")
+    insert_project(db_conn, project)
+    for state in (TaskState.DONE, TaskState.PROMOTED, TaskState.ROLLED_BACK):
+        task = Task(project_id=project.id, description=f"tâche {state.value}", status=state)
+        insert_task(db_conn, task)
+
+        with pytest.raises(ValueError, match=state.value):
+            activate_task(db_conn, task.id, tmp_path / "logs")
+
+        assert get_active_task_id(db_conn, project.id) is None  # jamais activée
+
+
+def test_activate_task_allows_non_terminal_states(db_conn, tmp_path):
+    """Non-régression : les états de travail actif restent activables."""
+    project = Project(name="projet-actif-2", path="C:/projet-actif-2")
+    insert_project(db_conn, project)
+    for state in (TaskState.RECEIVED, TaskState.EXECUTING, TaskState.TESTING, TaskState.FAILED, TaskState.BLOCKED, TaskState.HUMAN_REQUIRED):
+        task = Task(project_id=project.id, description=f"tâche {state.value}", status=state)
+        insert_task(db_conn, task)
+        activate_task(db_conn, task.id, tmp_path / "logs")
+        assert get_active_task_id(db_conn, project.id) == task.id
+
+
+def test_deactivate_task_clears_when_matching(db_conn, tmp_path):
     project, task = _make_project_and_task(db_conn)
-    activate_task(db_conn, task.id)
+    activate_task(db_conn, task.id, tmp_path / "logs")
 
-    cleared = deactivate_task(db_conn, task.id)
+    cleared = deactivate_task(db_conn, task.id, tmp_path / "logs")
 
     assert cleared is True
     assert get_active_task_id(db_conn, project.id) is None
 
 
-def test_deactivate_task_no_op_when_not_the_active_one(db_conn):
+def test_deactivate_task_no_op_when_not_the_active_one(db_conn, tmp_path):
     project = Project(name="projet-deact", path="C:/projet-deact")
     insert_project(db_conn, project)
     task_a = Task(project_id=project.id, description="tâche A")
     task_b = Task(project_id=project.id, description="tâche B")
     insert_task(db_conn, task_a)
     insert_task(db_conn, task_b)
-    activate_task(db_conn, task_a.id)
+    activate_task(db_conn, task_a.id, tmp_path / "logs")
 
     # task_b n'est pas la tâche active : ne doit RIEN désactiver, jamais un
     # no-op silencieux fondé sur une mauvaise supposition.
-    cleared = deactivate_task(db_conn, task_b.id)
+    cleared = deactivate_task(db_conn, task_b.id, tmp_path / "logs")
 
     assert cleared is False
     assert get_active_task_id(db_conn, project.id) == task_a.id  # task_a reste active
 
 
-def test_deactivate_task_if_active_never_raises_on_unknown_task(db_conn):
-    deactivate_task_if_active(db_conn, "inexistant")  # ne doit pas lever
+def test_deactivate_task_if_active_never_raises_on_unknown_task(db_conn, tmp_path):
+    deactivate_task_if_active(db_conn, "inexistant", tmp_path / "logs", trigger="manual")  # ne doit pas lever
+
+
+# --- traçabilité JSONL (V0.5, correctif) --------------------------------
+
+def test_activate_and_deactivate_write_jsonl_events(db_conn, tmp_path):
+    """La journalisation JSONL de chaque activation/désactivation n'est pas
+    facultative : ceci prouve une entrée RÉELLE dans logs/*.jsonl, pas
+    seulement l'effet en base."""
+    import json
+
+    logs_dir = tmp_path / "logs"
+    project, task = _make_project_and_task(db_conn)
+
+    activate_task(db_conn, task.id, logs_dir)
+    deactivate_task(db_conn, task.id, logs_dir, trigger="manual")
+
+    log_files = list(logs_dir.glob("herbert-*.jsonl"))
+    assert log_files, "aucun fichier JSONL écrit"
+    events = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    active_task_events = [e for e in events if e["component"] == "active_task"]
+
+    assert len(active_task_events) == 2
+    assert active_task_events[0]["event"] == "tâche activée"
+    assert active_task_events[0]["task_id"] == task.id
+    assert active_task_events[0]["details"]["trigger"] == "manual"
+    assert active_task_events[1]["event"] == "tâche désactivée"
+    assert active_task_events[1]["details"]["trigger"] == "manual"
+
+
+def test_deactivate_task_if_active_writes_jsonl_with_given_trigger(db_conn, tmp_path):
+    import json
+
+    logs_dir = tmp_path / "logs"
+    project, task = _make_project_and_task(db_conn)
+    activate_task(db_conn, task.id, logs_dir)
+
+    deactivate_task_if_active(db_conn, task.id, logs_dir, trigger="auto_rollback")
+
+    log_files = list(logs_dir.glob("herbert-*.jsonl"))
+    events = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    deactivation = next(e for e in events if e["component"] == "active_task" and e["event"] == "tâche désactivée")
+    assert deactivation["details"]["trigger"] == "auto_rollback"
+
+
+def test_deactivate_task_no_op_writes_no_jsonl_event(db_conn, tmp_path):
+    """Un no-op (tâche pas active) ne doit pas produire une fausse entrée de
+    désactivation — rien ne s'est réellement passé."""
+    import json
+
+    logs_dir = tmp_path / "logs"
+    project = Project(name="projet-noop", path="C:/projet-noop")
+    insert_project(db_conn, project)
+    task = Task(project_id=project.id, description="jamais activée")
+    insert_task(db_conn, task)
+
+    deactivate_task(db_conn, task.id, logs_dir, trigger="manual")
+
+    log_files = list(logs_dir.glob("herbert-*.jsonl"))
+    if log_files:
+        events = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+        assert not [e for e in events if e["component"] == "active_task"]
 
 
 def test_resolve_active_task_id_for_hook_returns_none_without_cwd(db_conn):
@@ -122,7 +210,7 @@ def test_resolve_active_task_id_for_hook_returns_active_task(db_conn, tmp_path):
     real_dir = tmp_path / "projet-hook"
     real_dir.mkdir()
     project, task = _make_project_and_task(db_conn, path=str(real_dir))
-    activate_task(db_conn, task.id)
+    activate_task(db_conn, task.id, tmp_path / "logs")
 
     assert resolve_active_task_id_for_hook(db_conn, str(real_dir)) == task.id
 
@@ -151,14 +239,14 @@ def test_isolation_par_projet_deux_sessions_paralleles(db_conn, tmp_path):
     project_a, task_a = _make_project_and_task(db_conn, project_name="projet-a", path=str(dir_a))
     project_b, task_b = _make_project_and_task(db_conn, project_name="projet-b", path=str(dir_b))
 
-    activate_task(db_conn, task_a.id)
-    activate_task(db_conn, task_b.id)
+    activate_task(db_conn, task_a.id, tmp_path / "logs")
+    activate_task(db_conn, task_b.id, tmp_path / "logs")
 
     assert resolve_active_task_id_for_hook(db_conn, str(dir_a)) == task_a.id
     assert resolve_active_task_id_for_hook(db_conn, str(dir_b)) == task_b.id
 
     # désactiver A ne doit pas toucher B
-    deactivate_task(db_conn, task_a.id)
+    deactivate_task(db_conn, task_a.id, tmp_path / "logs")
     assert resolve_active_task_id_for_hook(db_conn, str(dir_a)) is None
     assert resolve_active_task_id_for_hook(db_conn, str(dir_b)) == task_b.id
 
@@ -251,7 +339,7 @@ def test_auto_deactivate_on_successful_promotion_health_check(isolated_repo_root
 
     assert cli_main.cmd_task_branch(argparse.Namespace(task_id=task.id)) == 0
     conn = get_connection(_db_path(isolated_repo_root))
-    activate_task(conn, task.id)
+    activate_task(conn, task.id, isolated_repo_root / "logs")
     conn.close()
 
     (project_dir / "feature.py").write_text("def feature():\n    return 'ok'\n", encoding="utf-8")
@@ -284,7 +372,7 @@ def test_auto_deactivate_on_auto_rollback(isolated_repo_root, tmp_path, monkeypa
     assert cli_main.cmd_task_branch(argparse.Namespace(task_id=task.id)) == 0
     candidate_branch = f"candidate/{task.id}"
     conn = get_connection(_db_path(isolated_repo_root))
-    activate_task(conn, task.id)
+    activate_task(conn, task.id, isolated_repo_root / "logs")
     conn.close()
 
     (project_dir / "feature.py").write_text("def feature():\n    return 'ok'\n", encoding="utf-8")
@@ -315,7 +403,7 @@ def test_no_auto_deactivate_on_plain_failed_task_test(isolated_repo_root, tmp_pa
     project_dir = _make_target_project(tmp_path)
     task, project = _make_task(isolated_repo_root, project_dir)
     conn = get_connection(_db_path(isolated_repo_root))
-    activate_task(conn, task.id)
+    activate_task(conn, task.id, isolated_repo_root / "logs")
     conn.close()
 
     (project_dir / "test_calc.py").write_text(
@@ -338,7 +426,7 @@ def test_auto_deactivate_on_manual_rollback(isolated_repo_root, tmp_path, monkey
 
     assert cli_main.cmd_task_branch(argparse.Namespace(task_id=task.id)) == 0
     conn = get_connection(_db_path(isolated_repo_root))
-    activate_task(conn, task.id)
+    activate_task(conn, task.id, isolated_repo_root / "logs")
     conn.close()
 
     (project_dir / "change.txt").write_text("x", encoding="utf-8")
