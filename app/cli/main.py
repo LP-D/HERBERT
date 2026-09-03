@@ -41,15 +41,26 @@ from app.models.enums import LogStatus  # noqa: E402
 from app.models.promotion import PromotionStatus  # noqa: E402
 from app.models.test_result import TestResultStatus  # noqa: E402
 from app.git_wrapper import (  # noqa: E402
+    EMPTY_TREE_SHA,
     GitWrapperError,
     checkout_branch,
     create_candidate_branch,
+    diff_numstat_since,
     get_current_branch,
     get_head_commit,
+    get_upstream_ref,
     merge_branch,
     push_to_origin,
     revert_commit,
     rollback_to_commit,
+)
+from app.push_classifier import classify_push  # noqa: E402
+from app.push_confirmation import (  # noqa: E402
+    MIN_CONFIRM_DELAY_SECONDS,
+    clear_pending_confirmation,
+    diff_fingerprint,
+    validate_confirmation,
+    write_pending_confirmation,
 )
 from app.pytest_runner import run_pytest_for_project  # noqa: E402
 from app.reporting.dashboard_builder import build_dashboard, open_dashboard  # noqa: E402
@@ -913,12 +924,92 @@ def cmd_dashboard_open(args: argparse.Namespace) -> int:
     return 0
 
 
+def _herbert_tests_pass() -> bool:
+    """Lance réellement la suite de tests complète de HERBERT (REPO_ROOT) et
+    retourne si elle est VERIFIED_PASS — critère réel pour classify_push,
+    jamais supposé. Fonction dédiée (plutôt qu'un appel direct à
+    run_pytest_for_project dans cmd_sync_push) pour rester mockable dans
+    les tests, comme run_all_security_checks."""
+    result = run_pytest_for_project(REPO_ROOT, task_id="__push_classification__")
+    return result.status == TestResultStatus.VERIFIED_PASS
+
+
 def cmd_sync_push(args: argparse.Namespace) -> int:
     """Push explicite vers origin. C'est la SEULE fonction de ce module qui
     appelle push_to_origin() — aucune autre commande (task create, task
     status, project add, etc.) n'y fait référence, directement ou
     indirectement. Un push reste toujours un acte volontaire de
-    l'utilisateur, jamais un sous-effet d'une autre commande."""
+    l'utilisateur, jamais un sous-effet d'une autre commande.
+
+    Avant toute action réseau : classification AUTO/MANUAL_REQUIRED du diff
+    à pousser (app/push_classifier.py). AUTO poursuit le flux existant
+    ci-dessous inchangé. MANUAL_REQUIRED bloque et exige une invocation
+    séparée avec --confirm-manual, au moins MIN_CONFIRM_DELAY_SECONDS après
+    le blocage (app/push_confirmation.py) — structurellement impossible à
+    satisfaire dans la même commande Bash chaînée que la vérification."""
+    branch = get_current_branch(REPO_ROOT)
+    upstream = get_upstream_ref(REPO_ROOT)
+    diff_base = upstream if upstream is not None else EMPTY_TREE_SHA
+
+    try:
+        head_commit = get_head_commit(REPO_ROOT)
+        files_changed, total_diff_lines = diff_numstat_since(REPO_ROOT, diff_base)
+    except GitWrapperError as exc:
+        print(f"[BLOCKED] impossible de calculer le diff à pousser: {exc} — vérification manuelle requise par défaut.")
+        return 1
+
+    if not files_changed:
+        print("[VERIFIED] rien à pousser (aucun commit local en avance sur l'amont).")
+        return 0
+
+    fingerprint = diff_fingerprint(head_commit, upstream)
+    tests_passed = _herbert_tests_pass()
+    classification = classify_push(files_changed, total_diff_lines, tests_passed)
+
+    classify_log_details = {
+        "branch": branch,
+        "upstream": upstream,
+        "files_changed": files_changed,
+        "total_diff_lines": total_diff_lines,
+        "tests_passed": tests_passed,
+        "decision": classification.decision,
+        "failed_criteria": classification.failed_criteria,
+    }
+
+    if classification.decision == "MANUAL_REQUIRED":
+        if not getattr(args, "confirm_manual", False):
+            write_pending_confirmation(REPO_ROOT, fingerprint, classification.failed_criteria)
+            append_jsonl_event(
+                _logs_dir(), component="cli.sync_push_classify", event="push classé MANUAL_REQUIRED",
+                level="WARNING", status=LogStatus.BLOCKED.value, details=classify_log_details,
+            )
+            print("[BLOCKED] push classé MANUAL_REQUIRED — vérification manuelle requise avant de pousser.")
+            for reason in classification.failed_criteria:
+                print(f"  - {reason}")
+            print(
+                f"Après vérification manuelle, relancez avec --confirm-manual "
+                f"(au moins {MIN_CONFIRM_DELAY_SECONDS}s après ce blocage, dans une commande séparée)."
+            )
+            return 1
+
+        valid, reason = validate_confirmation(REPO_ROOT, fingerprint)
+        if not valid:
+            print(f"[BLOCKED] --confirm-manual refusé: {reason}")
+            return 1
+
+        clear_pending_confirmation(REPO_ROOT)
+        append_jsonl_event(
+            _logs_dir(), component="cli.sync_push_classify", event="push MANUAL_REQUIRED confirmé manuellement",
+            level="INFO", status=LogStatus.VERIFIED.value, details=classify_log_details,
+        )
+        print("[VERIFIED] confirmation manuelle acceptée — push MANUAL_REQUIRED autorisé à continuer.")
+    else:
+        append_jsonl_event(
+            _logs_dir(), component="cli.sync_push_classify", event="push classé AUTO",
+            level="INFO", status=LogStatus.VERIFIED.value, details=classify_log_details,
+        )
+        print(f"[VERIFIED] push classé AUTO ({len(files_changed)} fichier, {total_diff_lines} ligne(s), tests VERIFIED_PASS).")
+
     security_results = run_all_security_checks()
     failed = [r for r in security_results if r.status == "FAILED"]
 
@@ -938,7 +1029,6 @@ def cmd_sync_push(args: argparse.Namespace) -> int:
             return 1
         print("[CLAIMED] push forcé malgré un échec de vérification sécurité, confirmé explicitement.")
 
-    branch = get_current_branch(REPO_ROOT)
     result = push_to_origin(REPO_ROOT, branch)
 
     append_jsonl_event(
@@ -1083,6 +1173,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="outrepasse un échec de vérification sécurité (une confirmation explicite reste requise)",
+    )
+    sync_push.add_argument(
+        "--confirm-manual",
+        action="store_true",
+        default=False,
+        help=(
+            "confirme un push classé MANUAL_REQUIRED — nécessite un blocage préalable "
+            f"séparé (engine sync push sans ce flag), au moins {MIN_CONFIRM_DELAY_SECONDS}s plus tôt"
+        ),
     )
     sync_push.set_defaults(func=cmd_sync_push)
 

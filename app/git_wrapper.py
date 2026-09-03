@@ -111,6 +111,52 @@ def revert_commit(repo_path: str | Path, commit_ref: str, mainline: int | None =
     return _run_git(repo_path, args)
 
 
+# SHA1 constant de l'arbre vide Git (universel, indépendant du dépôt) —
+# utilisé comme référence de diff quand aucune branche amont n'existe
+# encore (tout premier push d'une branche) : tout le contenu de HEAD est
+# alors "le diff à pousser", sans cas particulier fragile.
+EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def get_upstream_ref(repo_path: str | Path) -> str | None:
+    """`origin/<branche>` si une branche amont est configurée (déjà
+    poussée au moins une fois avec suivi), None sinon — ex. tout premier
+    push d'une branche, où @{u} n'a rien à résoudre."""
+    result = _run_git(repo_path, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    if not result.ok:
+        return None
+    return result.stdout
+
+
+def diff_numstat_since(repo_path: str | Path, ref: str) -> tuple[list[str], int]:
+    """Fichiers modifiés + total de lignes changées (ajouts+suppressions)
+    entre `ref` et HEAD — utilisé par la classification AUTO/MANUAL_REQUIRED
+    de `engine sync push` (app/push_classifier.py). `ref` peut être
+    EMPTY_TREE_SHA pour le tout premier push d'une branche."""
+    result = _run_git(repo_path, ["diff", "--numstat", ref, "HEAD"])
+    if not result.ok:
+        raise GitWrapperError(f"impossible de calculer le diff numstat depuis {ref}: {result.stderr}")
+
+    files: list[str] = []
+    total_lines = 0
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        added_str, deleted_str, path = parts
+        # Fichier binaire : git rapporte "-" pour added/deleted (pas
+        # mesurable en lignes). Traité prudemment comme un total élevé
+        # pour forcer MANUAL_REQUIRED plutôt que de sous-compter
+        # silencieusement à 0 — le doute ne bénéficie jamais à l'auto-push.
+        added = int(added_str) if added_str.isdigit() else 10_000
+        deleted = int(deleted_str) if deleted_str.isdigit() else 10_000
+        total_lines += added + deleted
+        files.append(path)
+    return files, total_lines
+
+
 def push_to_origin(repo_path: str | Path, branch: str | None = None) -> GitResult:
     """Push explicite vers origin/<branch>. N'est appelé nulle part ailleurs
     dans HERBERT que par la commande CLI `engine sync push` — jamais en
