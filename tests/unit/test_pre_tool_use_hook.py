@@ -281,6 +281,45 @@ def test_pre_tool_use_allows_settings_json_mentioned_in_content_written_elsewher
     assert exit_code == 0, message
 
 
+def test_pre_tool_use_allows_read_command_on_separate_line_after_unrelated_write(
+    pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch
+):
+    """Faux positif réel #4 (constaté en usage réel, task_id
+    733df5b3-13d9-41db-b546-dfcf8094feb8, session motus-solver) :
+    `cp settings.json backup.json` suivi sur une LIGNE SÉPARÉE (pas &&/;/|)
+    de `sha256sum settings.json` était bloqué à tort — sans segmentation
+    sur le retour à la ligne, sha256sum "volait" son argument comme si
+    c'était la cible d'écriture du cp précédent. La vraie cible du cp
+    (backup.json, hors du fichier protégé) doit être autorisée ; la
+    lecture sha256sum n'écrit rien nulle part."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    settings_path = isolated_repo_root / ".claude" / "settings.json"
+    backup_path = tmp_path / "settings.json.backup"
+
+    command = f'cp "{settings_path}" "{backup_path}"\nsha256sum "{settings_path}"'
+    event = {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 0, f"cp vers un backup + sha256sum sur ligne séparée ne doit pas être bloqué: {message}"
+
+
+def test_pre_tool_use_still_blocks_write_to_settings_json_on_its_own_line(
+    pre_tool_use_module, isolated_repo_root, tmp_path, monkeypatch
+):
+    """Non-régression inverse : une VRAIE écriture malveillante sur
+    settings.json, placée sur sa propre ligne après une commande anodine,
+    doit rester bloquée — la segmentation par ligne ne doit pas non plus
+    créer un nouveau trou en isolant chaque ligne les unes des autres."""
+    monkeypatch.setattr(pre_tool_use_module, "REPO_ROOT", isolated_repo_root)
+    settings_path = isolated_repo_root / ".claude" / "settings.json"
+
+    command = f'echo "diagnostic anodin"\necho "{{}}" >> "{settings_path}"'
+    event = {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    exit_code, message = pre_tool_use_module.handle_event(event)
+    assert exit_code == 2, "l'écriture réelle sur settings.json (même sur sa propre ligne) doit rester bloquée"
+
+
 def test_pre_tool_use_blocks_powershell_style_write_to_settings_json(
     pre_tool_use_module, isolated_repo_root, monkeypatch
 ):

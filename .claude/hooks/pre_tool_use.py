@@ -60,7 +60,19 @@ ADDITIONAL_DANGEROUS_PATTERNS: list[tuple[re.Pattern, str]] = generate_hook_patt
 # type Set-Content/Remove-Item/cp/mv/sed -i), la résout en chemin
 # canonique par rapport à project_root, et ne bloque que si elle est
 # EXACTEMENT .claude/settings.json de CE projet.
-SHELL_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\|")
+#
+# `\r?\n` inclus depuis le correctif du 2026-09-03 (faux positif réel
+# constaté en usage réel, task_id 733df5b3-13d9-41db-b546-dfcf8094feb8) :
+# deux commandes indépendantes sur deux LIGNES distinctes (jamais reliées
+# par &&/;/|) étaient traitées comme un seul segment — une commande de
+# LECTURE placée après une écriture légitime (ex. `cp ... backup.json`
+# suivi de `sha256sum ... settings.json` sur la ligne suivante) "volait"
+# son dernier argument positionnel comme cible d'écriture du `cp`
+# précédent. Segmenter aussi sur le retour à la ligne élimine cette
+# contamination inter-lignes sans réduire la protection : une vraie
+# écriture malveillante sur sa propre ligne reste détectée sur CETTE
+# ligne — voir test_pre_tool_use_allows_read_command_on_separate_line_after_unrelated_write.
+SHELL_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\||\r?\n")
 
 # `>` / `>>` (avec préfixe optionnel de descripteur de fichier numérique,
 # ex. `2>`) — jamais précédé de `-` (exclut `->` dans du texte) — ou
