@@ -72,6 +72,13 @@ ADDITIONAL_DANGEROUS_PATTERNS: list[tuple[re.Pattern, str]] = generate_hook_patt
 # contamination inter-lignes sans réduire la protection : une vraie
 # écriture malveillante sur sa propre ligne reste détectée sur CETTE
 # ligne — voir test_pre_tool_use_allows_read_command_on_separate_line_after_unrelated_write.
+#
+# Ce détecteur reste et restera nécessairement basé sur une segmentation
+# de texte de commande (Bash n'a pas de file_path structuré, contrairement
+# à Write/Edit qui utilisent la résolution canonique de chemin via
+# _is_protected_settings_json) — ce n'est pas une régression vers l'ancien
+# bug de matching texte brut, c'est une contrainte structurelle de l'outil
+# Bash lui-même.
 SHELL_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\||\r?\n")
 
 # `>` / `>>` (avec préfixe optionnel de descripteur de fichier numérique,
