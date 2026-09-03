@@ -57,6 +57,7 @@ from app.git_wrapper import (  # noqa: E402
 from app.push_classifier import classify_push  # noqa: E402
 from app.push_confirmation import (  # noqa: E402
     MIN_CONFIRM_DELAY_SECONDS,
+    TOKEN_EXPIRY_WINDOW_SECONDS,
     clear_pending_confirmation,
     diff_fingerprint,
     validate_confirmation,
@@ -944,9 +945,21 @@ def cmd_sync_push(args: argparse.Namespace) -> int:
     Avant toute action réseau : classification AUTO/MANUAL_REQUIRED du diff
     à pousser (app/push_classifier.py). AUTO poursuit le flux existant
     ci-dessous inchangé. MANUAL_REQUIRED bloque et exige une invocation
-    séparée avec --confirm-manual, au moins MIN_CONFIRM_DELAY_SECONDS après
-    le blocage (app/push_confirmation.py) — structurellement impossible à
-    satisfaire dans la même commande Bash chaînée que la vérification."""
+    séparée avec --confirm-manual (app/push_confirmation.py).
+
+    Ce que ce mécanisme garantit RÉELLEMENT, vérifié empiriquement (pas
+    supposé) : il empêche le chaînage INSTANTANÉ vérification+confirmation
+    (le cas réel qui a motivé ce mécanisme — un push exécuté sans jamais
+    observer l'état entre les deux), et il détecte un jeton périmé si le
+    diff a changé depuis le blocage (empreinte HEAD+amont). Il n'empêche
+    PAS un contournement délibéré : un agent qui insère un `sleep` explicite
+    d'une durée suffisante DANS la même commande peut satisfaire la fenêtre
+    de validité du jeton (testé empiriquement le 2026-09-03 : un sleep de
+    31s dans un seul script suffit). La fenêtre de validité est
+    volontairement étroite (voir TOKEN_EXPIRY_WINDOW_SECONDS dans
+    app/push_confirmation.py) précisément pour qu'un tel contournement
+    nécessite un sleep explicite et anormalement long dans la commande
+    elle-même — un signal visible, pas une garantie structurelle absolue."""
     branch = get_current_branch(REPO_ROOT)
     upstream = get_upstream_ref(REPO_ROOT)
     diff_base = upstream if upstream is not None else EMPTY_TREE_SHA
@@ -988,7 +1001,8 @@ def cmd_sync_push(args: argparse.Namespace) -> int:
                 print(f"  - {reason}")
             print(
                 f"Après vérification manuelle, relancez avec --confirm-manual "
-                f"(au moins {MIN_CONFIRM_DELAY_SECONDS}s après ce blocage, dans une commande séparée)."
+                f"(entre {MIN_CONFIRM_DELAY_SECONDS}s et {MIN_CONFIRM_DELAY_SECONDS + TOKEN_EXPIRY_WINDOW_SECONDS}s "
+                f"après ce blocage — le jeton expire ensuite, dans une commande séparée)."
             )
             return 1
 
@@ -1180,7 +1194,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "confirme un push classé MANUAL_REQUIRED — nécessite un blocage préalable "
-            f"séparé (engine sync push sans ce flag), au moins {MIN_CONFIRM_DELAY_SECONDS}s plus tôt"
+            f"(engine sync push sans ce flag), entre {MIN_CONFIRM_DELAY_SECONDS}s et "
+            f"{MIN_CONFIRM_DELAY_SECONDS + TOKEN_EXPIRY_WINDOW_SECONDS}s après ce blocage (le jeton expire ensuite)"
         ),
     )
     sync_push.set_defaults(func=cmd_sync_push)

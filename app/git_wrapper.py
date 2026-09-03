@@ -160,7 +160,15 @@ def diff_numstat_since(repo_path: str | Path, ref: str) -> tuple[list[str], int]
 def push_to_origin(repo_path: str | Path, branch: str | None = None) -> GitResult:
     """Push explicite vers origin/<branch>. N'est appelé nulle part ailleurs
     dans HERBERT que par la commande CLI `engine sync push` — jamais en
-    sous-effet d'une autre opération (commit, task create, etc.)."""
+    sous-effet d'une autre opération (commit, task create, etc.).
+
+    `-u` (--set-upstream) : sans lui, `git push origin <branch>` ne configure
+    JAMAIS le tracking amont (@{u}) — bug réel constaté le 2026-09-03 sur
+    une branche jamais poussée avec -u, où get_upstream_ref() retombait en
+    permanence sur EMPTY_TREE_SHA, faussant silencieusement le calcul du
+    diff pour la classification AUTO/MANUAL_REQUIRED (app/push_classifier.py)
+    à CHAQUE push suivant, pas seulement le premier. Idempotent : ré-exécuter
+    -u sur une branche déjà trackée ne change rien d'observable."""
     if branch is None:
         branch = get_current_branch(repo_path)
-    return _run_git(repo_path, ["push", "origin", branch])
+    return _run_git(repo_path, ["push", "-u", "origin", branch])

@@ -1,16 +1,27 @@
 """Jeton de confirmation manuelle pour un push classé MANUAL_REQUIRED
 (app/push_classifier.py) — voir cmd_sync_push dans app/cli/main.py.
 
-Empêche structurellement qu'un agent chaîne la vérification et le push
-forcé dans une seule invocation Bash : `--confirm-manual` n'est accepté
-que si un jeton a été écrit par un appel PRÉCÉDENT et SÉPARÉ de
-`engine sync push` (classé MANUAL_REQUIRED), au moins
-MIN_CONFIRM_DELAY_SECONDS plus tôt, et pour EXACTEMENT le même diff
-(empreinte = hash de la ref amont + du commit HEAD au moment du blocage) —
-un nouveau commit après le blocage invalide le jeton, il faut se refaire
-bloquer avant de confirmer. Le délai minimum rend une invocation chaînée
-("vérifier puis forcer dans la même commande") structurellement
-insuffisante : les deux étapes ne peuvent pas partager le même instant.
+`--confirm-manual` n'est accepté que si un jeton a été écrit par un appel
+PRÉCÉDENT de `engine sync push` (classé MANUAL_REQUIRED), pour EXACTEMENT
+le même diff (empreinte = hash de la ref amont + du commit HEAD au moment
+du blocage — un nouveau commit après le blocage invalide le jeton), ET
+dans une FENÊTRE de validité étroite : entre MIN_CONFIRM_DELAY_SECONDS et
+MIN_CONFIRM_DELAY_SECONDS + TOKEN_EXPIRY_WINDOW_SECONDS après l'écriture
+du jeton.
+
+CE QUE ÇA GARANTIT RÉELLEMENT (vérifié empiriquement le 2026-09-03, pas
+supposé) : empêche le chaînage INSTANTANÉ vérification+confirmation (le
+cas réel qui a motivé ce mécanisme), et élimine la possibilité d'attendre
+PASSIVEMENT un prochain point de contact quelconque pour confirmer (sans
+la fenêtre haute, un jeton resterait valide indéfiniment tant que le diff
+ne change pas). CE QUE ÇA NE GARANTIT PAS : un agent qui insère un
+`sleep` explicite d'une durée comprise dans la fenêtre, DANS la même
+commande/le même script, peut toujours satisfaire les deux bornes — testé
+empiriquement (sleep 31s dans un seul script Python = confirmation
+acceptée). La fenêtre étroite ne rend pas ça structurellement impossible,
+elle force ce sleep à être explicite et anormalement long dans la
+commande elle-même — un signal visible pour qui relit le tool call, pas
+une garantie absolue du code.
 """
 import hashlib
 import json
@@ -18,6 +29,11 @@ import time
 from pathlib import Path
 
 MIN_CONFIRM_DELAY_SECONDS = 30
+# Fenêtre de validité APRÈS le délai minimum — volontairement courte pour
+# forcer un sleep explicite proche de MIN_CONFIRM_DELAY_SECONDS plutôt que
+# de permettre une confirmation "à tout moment ultérieur, tant que le diff
+# n'a pas changé".
+TOKEN_EXPIRY_WINDOW_SECONDS = 10
 
 
 def diff_fingerprint(head_commit: str, upstream_ref: str | None) -> str:
@@ -67,6 +83,14 @@ def validate_confirmation(
         return False, (
             f"délai minimum non atteint ({elapsed:.1f}s / {MIN_CONFIRM_DELAY_SECONDS}s) — "
             "--confirm-manual ne peut pas suivre le blocage dans la même action"
+        )
+
+    max_valid = MIN_CONFIRM_DELAY_SECONDS + TOKEN_EXPIRY_WINDOW_SECONDS
+    if elapsed > max_valid:
+        return False, (
+            f"jeton expiré ({elapsed:.1f}s écoulées, fenêtre de validité "
+            f"[{MIN_CONFIRM_DELAY_SECONDS}s, {max_valid}s]) — relancez `engine sync push` "
+            "pour un nouveau blocage, --confirm-manual ne se garde pas indéfiniment"
         )
 
     return True, "confirmation valide"
