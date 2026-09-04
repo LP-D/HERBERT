@@ -1006,17 +1006,24 @@ def cmd_sync_push(args: argparse.Namespace) -> int:
             )
             return 1
 
-        valid, reason = validate_confirmation(REPO_ROOT, fingerprint)
+        valid, reason, elapsed_seconds = validate_confirmation(REPO_ROOT, fingerprint)
+        confirm_attempt_details = {**classify_log_details, "elapsed_seconds": elapsed_seconds, "reason": reason}
+        elapsed_str = f"{elapsed_seconds:.1f}s" if elapsed_seconds is not None else "n/d"
+
         if not valid:
-            print(f"[BLOCKED] --confirm-manual refusé: {reason}")
+            append_jsonl_event(
+                _logs_dir(), component="cli.sync_push_classify", event="push MANUAL_REQUIRED confirmation refusée",
+                level="WARNING", status=LogStatus.BLOCKED.value, details=confirm_attempt_details,
+            )
+            print(f"[BLOCKED] --confirm-manual refusé: {reason} (temps écoulé depuis blocage: {elapsed_str})")
             return 1
 
         clear_pending_confirmation(REPO_ROOT)
         append_jsonl_event(
             _logs_dir(), component="cli.sync_push_classify", event="push MANUAL_REQUIRED confirmé manuellement",
-            level="INFO", status=LogStatus.VERIFIED.value, details=classify_log_details,
+            level="INFO", status=LogStatus.VERIFIED.value, details=confirm_attempt_details,
         )
-        print("[VERIFIED] confirmation manuelle acceptée — push MANUAL_REQUIRED autorisé à continuer.")
+        print(f"[VERIFIED] confirmation manuelle acceptée ({elapsed_str} écoulées) — push MANUAL_REQUIRED autorisé à continuer.")
     else:
         append_jsonl_event(
             _logs_dir(), component="cli.sync_push_classify", event="push classé AUTO",

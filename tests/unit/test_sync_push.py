@@ -11,6 +11,18 @@ def _run_git(cwd, *args):
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
 
 
+def _read_jsonl_events(work_repo):
+    """Lit le fichier de log JSONL du jour sous work_repo/logs (config par
+    défaut quand config/system.yaml est absent, voir app/config.py)."""
+    import json
+    from datetime import datetime, timezone
+
+    log_file = work_repo / "logs" / f"herbert-{datetime.now(timezone.utc):%Y-%m-%d}.jsonl"
+    if not log_file.exists():
+        return []
+    return [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 @pytest.fixture
 def repo_with_local_bare_origin(tmp_path):
     """Un dépôt de travail avec un VRAI remote 'origin', mais un remote
@@ -208,6 +220,16 @@ def test_sync_push_confirm_manual_after_delay_succeeds(repo_with_local_bare_orig
     remote_head = _run_git(bare_origin, "rev-parse", "HEAD").stdout.strip()
     assert local_head == remote_head, "le push confirmé doit réellement avoir eu lieu"
 
+    # recalibrage 2026-09-04 : le temps réellement écoulé doit être
+    # journalisé de façon structurée (pas juste dans le message imprimé),
+    # pour disposer de données réelles si un futur recalibrage est requis.
+    confirmed_events = [
+        e for e in _read_jsonl_events(work_repo) if e["event"] == "push MANUAL_REQUIRED confirmé manuellement"
+    ]
+    assert confirmed_events, "la confirmation réussie doit être journalisée en JSONL"
+    assert confirmed_events[-1]["details"]["elapsed_seconds"] is not None
+    assert confirmed_events[-1]["details"]["elapsed_seconds"] >= 0
+
 
 def test_sync_push_confirm_manual_after_new_commit_invalidates_stale_token(repo_with_local_bare_origin, monkeypatch):
     """Le jeton est lié à une empreinte précise du diff : un NOUVEAU commit
@@ -244,5 +266,16 @@ def test_sync_push_confirm_manual_after_new_commit_invalidates_stale_token(repo_
     monkeypatch.setattr(cli_main, "push_to_origin", _fail_if_called)
 
     confirm_exit = cli_main.cmd_sync_push(argparse.Namespace(force_unsafe=False, confirm_manual=True))
+
+    assert confirm_exit == 1
+
+    # recalibrage 2026-09-04 : un refus doit aussi être journalisé avec le
+    # temps réellement écoulé, pas seulement affiché dans le message — même
+    # ici où le token existe mais ne correspond plus au diff courant.
+    refused_events = [
+        e for e in _read_jsonl_events(work_repo) if e["event"] == "push MANUAL_REQUIRED confirmation refusée"
+    ]
+    assert refused_events, "le refus de confirmation (jeton obsolète) doit être journalisé en JSONL"
+    assert refused_events[-1]["details"]["elapsed_seconds"] is not None
 
     assert confirm_exit == 1
