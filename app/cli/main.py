@@ -606,7 +606,20 @@ def cmd_task_test(args: argparse.Namespace) -> int:
     # alors que la table de transitions prévoyait déjà TESTING->DONE/FAILED
     # sans jamais les emprunter. Nécessaire pour que `engine task promote`
     # (V0.3) ait un état DONE réel à vérifier, pas seulement un ChangeProof.
-    advance_after_test_result(conn, task, passed=(result.status == TestResultStatus.VERIFIED_PASS))
+    #
+    # `headless_reason` (pivot orchestration headless, voir docs/DECISIONS.md) :
+    # absent pour tout appel CLI normal (`engine task test`), donc None —
+    # comportement inchangé. app/headless_orchestrator.py construit son
+    # propre argparse.Namespace avec cet attribut renseigné ("timeout",
+    # "échec d'invocation", ...) quand l'itération n'a pas pu produire un
+    # vrai résultat de tests, pour que ce soit diagnosticable dans le
+    # dashboard (state_transitions.reason) sans nouveau code de rendu.
+    advance_after_test_result(
+        conn,
+        task,
+        passed=(result.status == TestResultStatus.VERIFIED_PASS),
+        reason=getattr(args, "headless_reason", None),
+    )
 
     append_jsonl_event(
         _logs_dir(),
@@ -641,6 +654,48 @@ def cmd_task_test(args: argparse.Namespace) -> int:
     if regressions:
         return 1
     return 0
+
+
+def cmd_task_run_headless(args: argparse.Namespace) -> int:
+    """Orchestration headless (pivot, voir docs/DECISIONS.md) : invoque
+    `claude` en headless pour cette tâche via app/headless_orchestrator.py,
+    relance automatiquement en cas d'échec de tests (plafond configurable,
+    config/system.yaml section claude_headless, jamais dépassé), classifie
+    le diff du projet cible en fin de boucle réussie (classify_push,
+    réutilisée telle quelle) — ne pousse jamais rien (`engine sync push`
+    reste l'unique porte vers un push réel, portée HERBERT lui-même,
+    inchangée par cette commande)."""
+    # Import différé : app/headless_orchestrator.py importe cmd_task_test et
+    # _regenerate_dashboard depuis ce module — un import en tête de fichier
+    # créerait une dépendance circulaire au chargement.
+    from app.headless_orchestrator import HeadlessOrchestrationError, run_headless_task
+
+    config = load_config(_config_path())
+    headless_config = config.get("claude_headless", {})
+    model = headless_config.get("model", "claude-sonnet-5")
+    max_iterations = int(headless_config.get("max_iterations", 3))
+    timeout_seconds = int(headless_config.get("timeout_seconds", 600))
+
+    conn = _connect()
+    try:
+        task = run_headless_task(
+            conn,
+            args.task_id,
+            _logs_dir(),
+            model=model,
+            max_iterations=max_iterations,
+            timeout_seconds=timeout_seconds,
+        )
+    except HeadlessOrchestrationError as exc:
+        print(f"[FAILED] {exc}")
+        return 1
+    finally:
+        conn.close()
+
+    print(f"[{task.status.value}] orchestration headless terminée pour la tâche {task.id} (modèle={model}, plafond={max_iterations})")
+    if task.status != TaskState.DONE:
+        print("  Nécessite une décision humaine avant de continuer (voir dashboard / state_transitions.reason).")
+    return 0 if task.status == TaskState.DONE else 1
 
 
 def cmd_task_promote(args: argparse.Namespace) -> int:
@@ -1157,6 +1212,13 @@ def build_parser() -> argparse.ArgumentParser:
     task_test = task_sub.add_parser("test", help="exécute pytest réellement dans le projet lié à la tâche")
     task_test.add_argument("task_id")
     task_test.set_defaults(func=cmd_task_test)
+
+    task_run_headless = task_sub.add_parser(
+        "run-headless",
+        help="invoque claude en headless pour cette tâche, relance jusqu'à échec×3 (config/system.yaml)",
+    )
+    task_run_headless.add_argument("task_id")
+    task_run_headless.set_defaults(func=cmd_task_run_headless)
 
     task_promote = task_sub.add_parser(
         "promote", help="merge candidate/<task_id> vers la branche stable + health check post-merge"

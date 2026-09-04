@@ -1,10 +1,29 @@
 # HERBERT V0.1 — LOCAL CORE
 
 Moteur local qui structure et sécurise l'usage de Claude Code sur des
-projets personnels. Pas d'agent, pas de Docker, aucun appel API
-Anthropic — Claude Code est un *consommateur* de HERBERT (via hooks),
-jamais une dépendance de HERBERT. Voir la charte du projet pour le
-détail des contraintes (NO FAKE, ZERO_EXTRA_COST).
+projets personnels. Pas de Docker, pas de sandbox, pas de scoring de
+risque, pas d'orchestration multi-agent générique — voir "Limites
+connues" plus bas et docs/DECISIONS.md pour le détail des exclusions de
+périmètre encore valides.
+
+**Depuis V0.6 (pivot orchestration headless, voir docs/DECISIONS.md,
+entrée dédiée) : le principe "Claude Code jamais une dépendance de
+HERBERT" est levé.** HERBERT peut désormais invoquer `claude` en headless
+(`engine task run-headless`, app/headless_orchestrator.py) pour une
+tâche donnée, plafonné à un nombre d'itérations fixe (config/system.yaml,
+section `claude_headless`, 3 par défaut — jamais dépassé, jamais une
+tentative supplémentaire silencieuse). Toute classification `MANUAL_REQUIRED`
+du diff produit (réutilise app/push_classifier.py) fait passer la tâche
+en `HUMAN_REQUIRED` et arrête l'orchestration : un push reste dans tous
+les cas une action strictement humaine — `engine sync push` demeure
+l'unique fonction qui appelle `push_to_origin()`, inchangée par ce pivot.
+
+**ZERO_EXTRA_COST est également affecté, explicitement** : contrairement
+au reste de HERBERT (stdlib pur, aucune dépendance payante), une
+invocation headless consomme réellement de l'usage Claude Code (API ou
+abonnement, selon l'authentification disponible) — plafonnée à 3
+itérations par tâche par défaut précisément pour borner ce coût, jamais
+illimitée. NO FAKE reste entier : voir la charte du projet.
 
 ## Installation / initialisation
 

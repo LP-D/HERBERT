@@ -54,7 +54,7 @@ def transition_task(
     return allowed, task, transition
 
 
-def advance_after_test_result(conn: sqlite3.Connection, task: Task, passed: bool) -> Task:
+def advance_after_test_result(conn: sqlite3.Connection, task: Task, passed: bool, reason: str | None = None) -> Task:
     """Fait avancer l'état de la tâche vers TESTING puis DONE/FAILED selon
     le résultat de `engine task test`, en empruntant le chemin légal depuis
     l'état courant (V0.2 posait les tables de transition TESTING->DONE/FAILED
@@ -64,7 +64,14 @@ def advance_after_test_result(conn: sqlite3.Connection, task: Task, passed: bool
     Best-effort et non bloquant : si l'état courant ne permet pas ce chemin
     (ex: la tâche est déjà PROMOTED, BLOCKED, ou HUMAN_REQUIRED), aucune
     transition n'est forcée — la tentative refusée est quand même
-    journalisée par transition_task, jamais un échec silencieux."""
+    journalisée par transition_task, jamais un échec silencieux.
+
+    `reason` (pivot orchestration headless) : None pour tout appelant
+    existant (comportement inchangé) ; app/headless_orchestrator.py y passe
+    une explication explicite ("timeout", "échec d'invocation", ...) quand
+    l'échec vient d'un problème d'invocation plutôt que d'un vrai échec de
+    tests — visible dans le dashboard via state_transitions.reason, sans
+    nouveau code de rendu."""
     current = task.status
 
     if current == TaskState.RECEIVED:
@@ -87,5 +94,5 @@ def advance_after_test_result(conn: sqlite3.Connection, task: Task, passed: bool
             return task
 
     target = TaskState.DONE if passed else TaskState.FAILED
-    _, task, _ = transition_task(conn, task.id, target, is_human_decision=False)
+    _, task, _ = transition_task(conn, task.id, target, reason=reason, is_human_decision=False)
     return task

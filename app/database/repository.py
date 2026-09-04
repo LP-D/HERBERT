@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from app.models import (
     ChangeProof,
     CommandLogEntry,
+    HeadlessInvocationStatus,
+    HeadlessIteration,
     Project,
     Promotion,
     PromotionStatus,
@@ -332,6 +334,52 @@ def get_latest_audit_log_details(conn: sqlite3.Connection, task_id: str, compone
     if row is None or row["details"] is None:
         return None
     return json.loads(row["details"])
+
+
+# --- headless_iterations (pivot orchestration headless) -----------------
+
+def insert_headless_iteration(conn: sqlite3.Connection, iteration: HeadlessIteration) -> None:
+    conn.execute(
+        """INSERT INTO headless_iterations
+           (id, task_id, iteration_number, prompt_sent, raw_result, session_id,
+            num_turns, invocation_status, tests_passed, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            iteration.id,
+            iteration.task_id,
+            iteration.iteration_number,
+            iteration.prompt_sent,
+            iteration.raw_result,
+            iteration.session_id,
+            iteration.num_turns,
+            iteration.invocation_status.value,
+            iteration.tests_passed,
+            iteration.created_at.isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def _headless_iteration_from_row(row: sqlite3.Row) -> HeadlessIteration:
+    return HeadlessIteration(
+        id=row["id"],
+        task_id=row["task_id"],
+        iteration_number=row["iteration_number"],
+        prompt_sent=row["prompt_sent"],
+        raw_result=row["raw_result"],
+        session_id=row["session_id"],
+        num_turns=row["num_turns"],
+        invocation_status=HeadlessInvocationStatus(row["invocation_status"]),
+        tests_passed=row["tests_passed"],
+        created_at=row["created_at"],
+    )
+
+
+def list_headless_iterations_for_task(conn: sqlite3.Connection, task_id: str) -> list[HeadlessIteration]:
+    rows = conn.execute(
+        "SELECT * FROM headless_iterations WHERE task_id = ? ORDER BY iteration_number", (task_id,)
+    ).fetchall()
+    return [_headless_iteration_from_row(r) for r in rows]
 
 
 # --- promotions (V0.3) ---------------------------------------------------

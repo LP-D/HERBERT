@@ -9,3 +9,8 @@ migrations:
 
 logs:
   dir: logs
+
+claude_headless:
+  model: claude-sonnet-5
+  max_iterations: 3
+  timeout_seconds: 600

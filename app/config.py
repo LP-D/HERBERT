@@ -10,6 +10,11 @@ DEFAULT_CONFIG = {
     "database": {"path": "data/herbert.db"},
     "migrations": {"dir": "migrations"},
     "logs": {"dir": "logs"},
+    # Pivot orchestration headless (voir docs/DECISIONS.md) : `model` est
+    # TOUJOURS explicite ici, jamais laissé au défaut implicite du CLI
+    # `claude` (~/.claude/settings.json peut pointer vers un modèle
+    # insuffisant pour une boucle de correction de code réelle, ex. haiku).
+    "claude_headless": {"model": "claude-sonnet-5", "max_iterations": "3", "timeout_seconds": "600"},
 }
 
 
@@ -67,7 +72,11 @@ def write_default_config(path: str | Path) -> Path:
         "migrations:\n"
         "  dir: migrations\n\n"
         "logs:\n"
-        "  dir: logs\n"
+        "  dir: logs\n\n"
+        "claude_headless:\n"
+        "  model: claude-sonnet-5\n"
+        "  max_iterations: 3\n"
+        "  timeout_seconds: 600\n"
     )
     path.write_text(content, encoding="utf-8")
     return path

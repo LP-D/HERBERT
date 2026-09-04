@@ -18,6 +18,14 @@ LEGAL_TRANSITIONS = {
     TaskState.FAILED: {
         TaskState.EXECUTING,
         TaskState.HUMAN_REQUIRED,
+        # BLOCKED (pivot orchestration headless, voir docs/DECISIONS.md) :
+        # plafond de 3 itérations épuisé dans app/headless_orchestrator.py.
+        # Absente jusqu'ici car FAILED n'était atteint que par un humain
+        # (qui repart en EXECUTING ou escalade en HUMAN_REQUIRED) — la
+        # boucle automatique a besoin d'un état visible distinct pour
+        # signaler "budget de tentatives épuisé", jamais une 4e tentative
+        # silencieuse.
+        TaskState.BLOCKED,
     },
     TaskState.BLOCKED: {
         TaskState.EXECUTING,
@@ -30,7 +38,12 @@ LEGAL_TRANSITIONS = {
     # DONE -> PROMOTED : gate réel appliqué par `engine task promote` sur le
     # dernier ChangeProof (VERIFIED_PASS, sans régression), pas seulement
     # par cette table — voir cmd_task_promote.
-    TaskState.DONE: {TaskState.PROMOTED},
+    # DONE -> HUMAN_REQUIRED (pivot orchestration headless, voir
+    # docs/DECISIONS.md) : après des tests passés, classify_push() peut
+    # classer le diff MANUAL_REQUIRED (app/headless_orchestrator.py) — la
+    # tâche reste DONE au sens "code fonctionnel", mais son passage à
+    # PROMOTED/push nécessite une décision humaine, jamais automatique.
+    TaskState.DONE: {TaskState.PROMOTED, TaskState.HUMAN_REQUIRED},
     # PROMOTED -> DONE : health check post-merge réussi.
     # PROMOTED -> ROLLED_BACK : health check en échec ET le revert du merge
     # a réellement réussi (AUTO_ROLLBACK) — voir cmd_task_promote. Si le
