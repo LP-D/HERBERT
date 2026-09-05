@@ -213,23 +213,44 @@ prompt (`build_context_prompt`) suit le principe général déjà énoncé
 (contexte pertinent et borné : tâche, projet, échec précédent — jamais
 un prompt gigantesque) sans dépendre de cette source.
 
-### Vérification live — PENDING, bloqué par l'environnement, pas par le code
+### Vérification live — CONFIRMÉE (2026-09-05, après `claude auth login`)
 
-Deux vérifications marquées obligatoires n'ont pas pu être exécutées en
-conditions réelles : une invocation headless réussie de bout en bout, et
-le test hooks-en-headless-via-HERBERT (Write direct sur
-`.claude/settings.json` déclenché depuis une vraie session headless).
-Cause vérifiée empiriquement (pas supposée), reproduite 3 fois :
-`claude -p ... --output-format json` échoue systématiquement à
-l'authentification dans ce contexte (`"Failed to authenticate: OAuth
-session expired and could not be refreshed"`, confirmé par
-`claude doctor` : "Not signed in to claude.ai") — un sous-processus
-`claude` lancé depuis cette session n'hérite pas de son authentification
-et ne peut pas se réauthentifier de façon non-interactive (pas
-d'`ANTHROPIC_API_KEY` disponible non plus). Hors du périmètre d'action de
-HERBERT (l'authentification OAuth est une action explicitement réservée
-à l'utilisateur). La couverture unitaire (`tests/unit/test_claude_headless.py`,
-`tests/unit/test_headless_orchestrator.py`, subprocess simulé) couvre la
-logique de boucle/parsing/transitions, mais ne remplace pas ces deux
-vérifications live — à refaire dès que l'authentification headless est
-en place.
+Les deux vérifications marquées obligatoires ont d'abord été bloquées par
+un défaut d'authentification (`claude -p ... --output-format json`
+échouait systématiquement — `"Failed to authenticate: OAuth session
+expired and could not be refreshed"`, reproduit 3 fois, cause confirmée
+par `claude doctor`). Résolu par l'utilisateur (`claude auth login`),
+hors du périmètre d'action de HERBERT — l'authentification OAuth reste
+une action explicitement réservée à l'utilisateur, jamais exécutée par
+HERBERT ou par moi.
+
+**3a — Invocation headless réussie**, via `invoke_claude_headless()`
+(pas un `claude -p` manuel) : `session_id=47dc0561-1fe4-4e10-ad83-4308c8f5b6ec`,
+`invocation_status=VERIFIED`, `is_error=false`, `result_text="ok"`,
+`num_turns=1`, `total_cost_usd≈0.43`. Confirme au passage le schéma de
+succès réel (absent du point 2 initial, calibré alors uniquement sur un
+échantillon d'erreur) : mêmes clés que documenté, `stop_reason="end_turn"`,
+`terminal_reason="completed"`.
+
+**3b — Hooks en headless piloté par HERBERT**, projet de test jetable
+créé pour l'occasion (`.claude/settings.json` réel pointant vers les
+hooks HERBERT, hors dépôt, suivi par git) : première tentative
+invalidée par une erreur de ma part (échappement JSON des chemins Windows
+raté dans le fixture de test — chemins corrigés en `/` plutôt que `\\`,
+JSON revalidé avant de relancer). Après correction, invocation headless
+réelle avec prompt honnête (contexte donné explicitement au modèle,
+aucune tentative de le tromper) demandant l'écriture directe sur
+`.claude/settings.json` du projet de test :
+- SQLite (`commands`) : `{'task_id': 'f621272d-3bf0-4249-8ad7-f1c29f8ac3ed', 'tool_name': 'Write', 'decision': 'DENY', 'reason': 'modification des règles de permission HERBERT elles-mêmes'}`
+- JSONL (`logs/herbert-2026-09-05.jsonl`) : entrée cohérente, même `task_id`, `status: BLOCKED`.
+- SHA-256 du fichier identique avant/après (`9a5aa3f1...`) — vérifié
+  directement (lecture du contenu), pas seulement par le hash.
+- `task_id` correctement attribué via `resolve_active_task_id_for_hook`
+  (tâche activée par `engine task activate` avant l'invocation, comme
+  prévu par `app/headless_orchestrator.py`).
+
+Les hooks se déclenchent identiquement en session headless qu'en session
+interactive — confirmé empiriquement, pas supposé. La couverture unitaire
+(`tests/unit/test_claude_headless.py`, `tests/unit/test_headless_orchestrator.py`,
+subprocess simulé) reste la couverture de régression ; ces deux
+vérifications live en sont le complément ponctuel, désormais fait.
