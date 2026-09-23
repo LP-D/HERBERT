@@ -223,6 +223,86 @@ def test_success_manual_required_classification_stops_at_human_required(
     conn.close()
 
 
+def _human_required_reason(conn, task_id):
+    row = conn.execute(
+        "SELECT from_state, reason FROM state_transitions WHERE task_id = ? AND to_state = 'HUMAN_REQUIRED'",
+        (task_id,),
+    ).fetchone()
+    assert row is not None, "transition DONE -> HUMAN_REQUIRED attendue"
+    assert row["from_state"] == "DONE"
+    return row["reason"]
+
+
+def test_agent_gaming_tests_via_conftest_is_human_required(isolated_repo_root, tmp_path, monkeypatch, logs_dir):
+    """Scénario réel visé par les défauts : l'agent ne corrige pas calc.py
+    mais fait passer le test en ajoutant un conftest.py qui patche le module
+    — 1 seul fichier, 2 lignes, tests VERIFIED_PASS. Sans chemins protégés
+    par projet, ce diff serait classé AUTO."""
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+
+    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+        (project_dir / "conftest.py").write_text("import calc\ncalc.value = lambda: 1\n", encoding="utf-8")
+        _run_git(project_dir, "add", "-A")
+        _run_git(project_dir, "commit", "-m", "tests verts (via conftest)")
+        return _success_result()
+
+    monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+
+    assert result_task.status == TaskState.HUMAN_REQUIRED
+    reason = _human_required_reason(conn, task.id)
+    assert "chemin sensible: conftest.py" in reason
+    assert "fichiers:" not in reason  # seul le critère de chemin a échoué
+    conn.close()
+
+
+def test_agent_touching_env_file_is_human_required(isolated_repo_root, tmp_path, monkeypatch, logs_dir):
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+
+    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+        (project_dir / "config").mkdir()
+        (project_dir / "config" / ".env").write_text("API_KEY=xyz\n", encoding="utf-8")
+        _fix_calc(project_dir)  # committe calc.py ET config/.env
+        return _success_result()
+
+    monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+
+    assert result_task.status == TaskState.HUMAN_REQUIRED
+    assert "chemin sensible: config/.env" in _human_required_reason(conn, task.id)
+    conn.close()
+
+
+def test_unreadable_project_patterns_force_human_required_on_otherwise_auto_diff(
+    isolated_repo_root, tmp_path, monkeypatch, logs_dir
+):
+    """Même diff que test_success_on_first_iteration_auto (classé AUTO),
+    mais la liste du projet est illisible en base : jamais AUTO par défaut."""
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+
+    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+        _fix_calc(project_dir)
+        return _success_result()
+
+    monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    conn.execute("UPDATE projects SET extra_blocked_patterns = ? WHERE id = ?", ("{cassé", project.id))
+    conn.commit()
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+
+    assert result_task.status == TaskState.HUMAN_REQUIRED
+    assert "liste de chemins protégés non résolue" in _human_required_reason(conn, task.id)
+    conn.close()
+
+
 def test_timeout_iteration_has_distinct_reason_and_consumes_budget(isolated_repo_root, tmp_path, monkeypatch, logs_dir):
     project_dir = _make_target_project(tmp_path, initial_value=2)
     task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)

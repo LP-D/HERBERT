@@ -6,8 +6,9 @@ plus — la borne est structurelle, `range(...)`, pas un `if` contournable).
 Réutilise sans réimplémenter : `cmd_task_test` (app/cli/main.py — checkout
 de la branche candidate, pytest réel, ChangeProof, transition d'état,
 dashboard) après CHAQUE itération, `classify_push` (app/push_classifier.py,
-inchangée) en fin de boucle réussie, `activate_task`/`deactivate_task_if_active`
-(app/active_task.py) pour l'attribution task_id des hooks.
+avec les chemins protégés du projet cible) en fin de boucle réussie,
+`activate_task`/`deactivate_task_if_active` (app/active_task.py) pour
+l'attribution task_id des hooks.
 
 Invariant non négociable : ce module n'appelle JAMAIS `push_to_origin`,
 directement ou indirectement — `engine sync push` reste l'unique porte
@@ -31,7 +32,7 @@ from app.git_wrapper import EMPTY_TREE_SHA, GitWrapperError, diff_numstat_since
 from app.logging_utils import append_jsonl_event
 from app.models import HeadlessIteration, TestResultStatus
 from app.models.enums import HeadlessInvocationStatus, LogStatus
-from app.push_classifier import classify_push
+from app.push_classifier import classify_push, resolve_blocked_patterns
 from app.state_machine.service import transition_task
 from app.state_machine.states import TaskState
 
@@ -175,14 +176,14 @@ def run_headless_task(
             return get_task(conn, task_id)
 
     # Boucle sortie via DONE : classification du diff du PROJET CIBLE (pas
-    # REPO_ROOT — cmd_sync_push/classify_push existant classifie uniquement
-    # le dépôt HERBERT lui-même, voir docs/DECISIONS.md). Réutilise
-    # classify_push() telle quelle (fonction pure) avec les données du
-    # projet cible. Limite documentée : BLOCKED_PATH_PREFIXES est propre à
-    # HERBERT, ne protège pas les chemins sensibles spécifiques au projet
-    # cible — seuls les critères génériques (1 fichier, <20 lignes, tests
-    # passés) sont pleinement pertinents hors HERBERT.
+    # REPO_ROOT). Chemins protégés = resolve_blocked_patterns(project) :
+    # DEFAULT_BLOCKED_PATTERNS + extra_blocked_patterns de CE projet (relu
+    # en base ici, pas l'objet chargé en début de boucle). Résolution
+    # échouée (valeur stockée illisible, projet disparu) -> None ->
+    # classify_push force MANUAL_REQUIRED, jamais AUTO par défaut. Voir
+    # docs/DECISIONS.md, "classify_push : portée corrigée" (résolu).
     task = get_task(conn, task_id)
+    blocked_patterns = resolve_blocked_patterns(get_project(conn, project.id))
     try:
         files_changed, total_diff_lines = diff_numstat_since(project.path, base_commit or EMPTY_TREE_SHA)
     except GitWrapperError as exc:
@@ -197,7 +198,9 @@ def run_headless_task(
         )
         return task
 
-    classification = classify_push(files_changed, total_diff_lines, tests_passed=True)
+    classification = classify_push(
+        files_changed, total_diff_lines, tests_passed=True, blocked_patterns=blocked_patterns
+    )
 
     append_jsonl_event(
         logs_dir,
@@ -209,6 +212,7 @@ def run_headless_task(
         details={
             "files_changed": files_changed,
             "total_diff_lines": total_diff_lines,
+            "blocked_patterns_resolved": blocked_patterns is not None,
             "decision": classification.decision,
             "failed_criteria": classification.failed_criteria,
         },

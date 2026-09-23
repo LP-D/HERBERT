@@ -132,8 +132,14 @@ def diff_numstat_since(repo_path: str | Path, ref: str) -> tuple[list[str], int]
     """Fichiers modifiés + total de lignes changées (ajouts+suppressions)
     entre `ref` et HEAD — utilisé par la classification AUTO/MANUAL_REQUIRED
     de `engine sync push` (app/push_classifier.py). `ref` peut être
-    EMPTY_TREE_SHA pour le tout premier push d'une branche."""
-    result = _run_git(repo_path, ["diff", "--numstat", ref, "HEAD"])
+    EMPTY_TREE_SHA pour le tout premier push d'une branche.
+
+    `--no-renames` : sans lui, git affiche un renommage sous forme compacte
+    (`app/{policy => other}/x.py`) qu'aucun motif de chemins protégés ne
+    reconnaît — déplacer un fichier protégé passait alors inaperçu. Ici,
+    un renommage apparaît comme suppression + ajout, deux chemins réels
+    vérifiés chacun individuellement."""
+    result = _run_git(repo_path, ["diff", "--numstat", "--no-renames", ref, "HEAD"])
     if not result.ok:
         raise GitWrapperError(f"impossible de calculer le diff numstat depuis {ref}: {result.stderr}")
 

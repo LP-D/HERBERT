@@ -157,12 +157,97 @@ cible. `app/headless_orchestrator.py` introduit un NOUVEAU site d'appel
 qui calcule `files_changed`/`total_diff_lines` sur `project.path` (le
 projet cible de la tâche, via `base_commit` enregistré par `engine task
 branch`) et réutilise `classify_push()` telle quelle (fonction pure,
-inchangée) sur ces données. **Limite documentée, pas cachée** :
+inchangée) sur ces données. ~~**Limite documentée, pas cachée** :
 `BLOCKED_PATH_PREFIXES` (`.claude/settings.json`, `app/policy/`, etc.)
 reste une liste de chemins propres à HERBERT — elle ne protège rien de
-spécifique à un projet cible. Seuls les critères génériques (exactement
-1 fichier commité, < 20 lignes, tests VERIFIED_PASS) sont pleinement
-pertinents hors HERBERT.
+spécifique à un projet cible.~~ **RÉSOLU** — voir section suivante.
+
+### Chemins protégés par projet pour classify_push (résout la limite ci-dessus)
+
+**Ce qui change.**
+- `classify_push(..., *, blocked_patterns)` : paramètre nommé
+  **obligatoire, sans défaut**. Un appelant qui l'oublie échoue
+  (`TypeError`) au lieu de retomber silencieusement sur une liste qui ne
+  concerne pas son dépôt. `None`, une liste vide, une chaîne seule ou un
+  élément non-chaîne ajoutent le critère « config : liste de chemins
+  protégés non résolue » : **toujours MANUAL_REQUIRED**, quels que soient
+  les autres critères.
+- `DEFAULT_BLOCKED_PATTERNS` (tout dépôt) et `HERBERT_BLOCKED_PATTERNS`
+  (défauts + les 8 préfixes historiques propres à HERBERT, passés par
+  `cmd_sync_push`). Deux syntaxes : préfixe ancré à la racine (comportement
+  historique) et `**/<glob>` sur le nom de fichier à n'importe quelle
+  profondeur. Comparaison insensible à la casse pour les deux (Windows /
+  `core.ignorecase` : `.GitHub/` ne doit pas contourner `.github/`).
+- Migration 0009 : `projects.extra_blocked_patterns` (JSON `list[str]`,
+  NULL = défauts seuls). **Ajout seulement** : aucune fonction ne retire
+  ni ne remplace un motif, `resolve_blocked_patterns(project)` renvoie
+  toujours les défauts en tête. Une valeur stockée illisible n'est jamais
+  « réparée » : la résolution renvoie `None` → MANUAL_REQUIRED, et
+  `engine project protect add` refuse de l'écraser.
+- `app/headless_orchestrator.py` relit le projet en base au moment de
+  classer et passe `resolve_blocked_patterns(project)`.
+- Les 3 exceptions `.env.example` / `.env.sample` / `.env.template` sont
+  codées en dur, limitées au motif `**/.env.*` : jamais exprimables par un
+  projet (sinon « ajout seulement » serait contournable par une négation).
+- `diff_numstat_since` passe `--no-renames` : avec la détection de
+  renommage, git affichait `app/{policy => other}/x.py`, qu'aucun préfixe
+  ne reconnaissait — déplacer un fichier protégé passait inaperçu, y
+  compris pour HERBERT lui-même. Un renommage apparaît désormais comme
+  suppression + ajout, deux chemins vérifiés chacun.
+
+**Pourquoi ces défauts — asymétrie coût faux positif / faux négatif.** Un
+faux positif coûte une confirmation manuelle (quelques minutes). Un faux
+négatif laisse passer en AUTO une modification que personne n'a relue,
+dans une catégorie où l'impact n'est pas borné par la taille du diff :
+- **secrets** (`.env`, `*.pem`, `*.key`, `id_rsa*`, `.npmrc`, `.pypirc`,
+  `secrets/`, `credentials*`…) — une ligne suffit à fuiter ou remplacer
+  une clé ;
+- **CI et hooks git** (`.github/`, `.gitlab-ci.yml`, `.husky/`,
+  `.pre-commit-config.yaml`…) — du code qui s'exécute ailleurs, avec
+  d'autres droits ;
+- **configuration de l'agent** (`.claude/`, `CLAUDE.md`, `.mcp.json`) —
+  l'agent ne doit jamais élargir ses propres permissions ou instructions
+  en AUTO ;
+- **ce qui décide si « les tests passent »** (`conftest.py` à toute
+  profondeur, `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`,
+  `noxfile.py`) — critère central de l'AUTO. Scénario testé réellement
+  (`test_agent_gaming_tests_via_conftest_is_human_required`) : un
+  `conftest.py` de 2 lignes qui patche le module fait passer la suite sans
+  rien corriger — 1 fichier, < 20 lignes, tests VERIFIED_PASS, donc AUTO
+  sans cette protection ;
+- **dépendances et build** (`requirements*`, `setup.py`, `Dockerfile*`,
+  `docker-compose*`) — ce qui s'exécute à l'installation ;
+- **exécution par l'éditeur** (`.vscode/tasks.json`, `.vscode/launch.json`
+  seulement — `settings.json` n'exécute rien) ;
+- **git** (`.gitignore`, `.gitattributes`, `.gitmodules`) — `.gitignore`
+  peut dé-ignorer un fichier de secrets. `.git/` n'est pas listé : son
+  contenu n'apparaît jamais dans `git diff`, le motif ne protégerait rien.
+
+Les préfixes spécifiques à HERBERT (`app/policy/`, `migrations/`…) ne sont
+PAS appliqués aux projets cibles : un projet peut avoir son propre
+`app/policy/` sans rapport. Un projet ajoute ses propres chemins avec
+`engine project protect add <projet> <motif>` (journalisé en JSONL,
+`task_id=None`).
+
+**CommandPolicy — constat et règle ajoutée.** Avant ce changement, rien
+n'empêchait une session Claude Code (interactive ou headless) de lancer
+`python engine.py ...` : aucune règle de `app/policy/command_policy.py` ne
+mentionnait `engine`, et le hook n'a **aucune notion de « session
+headless »** (même politique pour toute session). Règle ajoutée :
+`engine_project_protect` (BLOCKED, regex `\bproject\s+protect\b`, hook
+uniquement) — la contrainte ne se configure jamais depuis la session
+qu'elle contraint. Limites, documentées plutôt que cachées :
+1. la règle ne s'applique que là où le hook HERBERT est déployé
+   (`.claude/settings.json` du projet cible, voir DEPLOYMENT.md) —
+   `invoke_claude_headless` ne passe pas `--settings`, donc un projet
+   cible sans ce fichier n'est protégé par AUCUNE règle CommandPolicy ;
+2. elle ne couvre pas une écriture directe en base (`sqlite3`, `python
+   -c`) — sans conséquence pour la sûreté de la liste : les défauts vivent
+   dans le code, une valeur en base ne peut qu'ajouter, et une valeur
+   corrompue force MANUAL_REQUIRED ;
+3. faux positif accepté : toute commande Bash contenant ce texte littéral
+   (ex. `git commit -m "..."`) est bloquée — passer par un fichier
+   (`git commit -F`).
 
 ### Transitions d'état ajoutées (2 arêtes, aucun nouvel état)
 

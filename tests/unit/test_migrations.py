@@ -53,6 +53,15 @@ def test_migration_is_idempotent(tmp_path):
     conn.close()
 
 
+def test_projects_has_nullable_extra_blocked_patterns_column(db_conn):
+    """Migration 0009 : colonne additive, NULL par défaut (= défauts seuls)."""
+    columns = {row["name"]: row for row in db_conn.execute("PRAGMA table_info(projects)").fetchall()}
+    assert "extra_blocked_patterns" in columns
+    assert columns["extra_blocked_patterns"]["type"] == "TEXT"
+    assert columns["extra_blocked_patterns"]["notnull"] == 0
+    assert columns["extra_blocked_patterns"]["dflt_value"] is None
+
+
 def test_foreign_keys_enabled(db_conn):
     row = db_conn.execute("PRAGMA foreign_keys").fetchone()
     assert row[0] == 1

@@ -12,6 +12,12 @@ class Project(BaseModel):
     # Soft delete (V0.5, point 2) : None = actif. Jamais de suppression
     # physique — voir app/database/repository.py::archive_project.
     archived_at: datetime | None = None
+    # Motifs protégés AJOUTÉS aux défauts de classify_push (migration 0009,
+    # voir app/push_classifier.py::resolve_blocked_patterns). [] = défauts
+    # seuls. None = valeur stockée illisible (JSON invalide ou pas une liste
+    # de chaînes) : jamais corrigée silencieusement ici, pour que la
+    # résolution échoue et force MANUAL_REQUIRED plutôt que de deviner.
+    extra_blocked_patterns: list[str] | None = Field(default_factory=list)
 
     @field_validator("name")
     @classmethod

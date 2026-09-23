@@ -94,6 +94,23 @@ POLICY: list[PolicyRule] = [
         "création/élévation de compte administrateur",
         hook_regex=r"\bnet\s+(user|localgroup)\b[^\n]*\b(add|administrators)\b",
     ),
+    # `engine project protect` modifie la liste de chemins protégés qui
+    # décide si un diff du projet est poussable en AUTO : un agent contraint
+    # par cette liste ne doit pas pouvoir y toucher lui-même, même en ajout
+    # seul (principe : la contrainte ne se configure jamais depuis la
+    # session qu'elle contraint). Réservé à un humain, depuis son propre
+    # terminal. Le hook n'a aucune notion de "session headless" : la règle
+    # s'applique à TOUTE session Claude Code où ce hook est déployé.
+    # Regex volontairement large (`project protect` quel que soit le point
+    # d'entrée : engine.py, python -m app.cli.main, chemin absolu, guillemets)
+    # — faux positif connu et accepté : toute commande contenant ce texte
+    # littéral (ex. un message de commit), à contourner par un fichier.
+    PolicyRule(
+        "engine_project_protect",
+        PolicyLevel.BLOCKED_OR_HUMAN_REQUIRED,
+        "modification des chemins protégés par classify_push (réservé à un humain hors session agent)",
+        hook_regex=r"\bproject\s+protect\b",
+    ),
     # Déclarée ici pour documentation/cohérence du message, mais PAS incluse
     # dans generate_hook_patterns() : logique dédiée par segment dans le
     # hook (voir docstring du module).

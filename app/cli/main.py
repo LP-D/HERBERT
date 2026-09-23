@@ -14,6 +14,7 @@ from app.config import load_config, write_default_config  # noqa: E402
 from app.database.connection import get_connection  # noqa: E402
 from app.database.migrate import apply_migrations, current_schema_version  # noqa: E402
 from app.database.repository import (  # noqa: E402
+    add_project_blocked_patterns,
     archive_project,
     archive_task,
     count_unarchived_tasks,
@@ -54,7 +55,12 @@ from app.git_wrapper import (  # noqa: E402
     revert_commit,
     rollback_to_commit,
 )
-from app.push_classifier import classify_push  # noqa: E402
+from app.push_classifier import (  # noqa: E402
+    BASENAME_PATTERN_MARKER,
+    DEFAULT_BLOCKED_PATTERNS,
+    HERBERT_BLOCKED_PATTERNS,
+    classify_push,
+)
 from app.push_confirmation import (  # noqa: E402
     MIN_CONFIRM_DELAY_SECONDS,
     TOKEN_EXPIRY_WINDOW_SECONDS,
@@ -213,6 +219,103 @@ def cmd_project_list(args: argparse.Namespace) -> int:
     for p in projects:
         archived_suffix = f"  [ARCHIVÉ le {p.archived_at.isoformat()}]" if p.archived_at else ""
         print(f"[VERIFIED] {p.id}  {p.name}  {p.path}  {p.created_at.isoformat()}{archived_suffix}")
+    return 0
+
+
+def _normalize_protect_pattern(raw: str) -> str | None:
+    """Forme canonique d'un motif saisi (syntaxe : voir app/push_classifier.py)
+    — séparateurs posix, sans `./` ni `/` initial. None si le motif est vide,
+    remonte hors du dépôt (`..`), est un chemin absolu Windows, ou si un
+    motif `**/<glob>` contient un `/` (il porte sur un NOM de fichier)."""
+    pattern = raw.strip().replace("\\", "/")
+    is_basename = pattern.startswith(BASENAME_PATTERN_MARKER)
+    body = pattern[len(BASENAME_PATTERN_MARKER):] if is_basename else pattern
+    while body.startswith("./"):
+        body = body[2:]
+    body = body.lstrip("/")
+    if not body or ":" in body or ".." in body.split("/"):
+        return None
+    if is_basename and "/" in body:
+        return None
+    return f"{BASENAME_PATTERN_MARKER}{body}" if is_basename else body
+
+
+def _get_project_by_name_or_id(conn: sqlite3.Connection, ref: str) -> Project | None:
+    return get_project_by_name(conn, ref) or get_project(conn, ref)
+
+
+def cmd_project_protect_add(args: argparse.Namespace) -> int:
+    """`engine project protect add <projet> <motif>` : AJOUTE un motif protégé
+    à ce projet (classify_push, voir app/push_classifier.py). Aucune commande
+    de retrait n'existe, par construction. Bloquée par CommandPolicy (règle
+    engine_project_protect) dans toute session Claude Code où le hook HERBERT
+    est déployé : réservée à un humain, depuis son propre terminal.
+    Journalisée en JSONL avec task_id=None (action hors tâche active)."""
+    pattern = _normalize_protect_pattern(args.pattern)
+    if pattern is None:
+        print(f"[FAILED] motif invalide: {args.pattern!r} (vide, absolu, contenant '..', ou '**/' suivi d'un chemin)")
+        return 1
+
+    conn = _connect()
+    project = _get_project_by_name_or_id(conn, args.project)
+    if project is None:
+        conn.close()
+        print(f"[FAILED] projet introuvable: {args.project}")
+        return 1
+
+    if pattern in DEFAULT_BLOCKED_PATTERNS:
+        conn.close()
+        print(f"[VERIFIED] motif déjà protégé par défaut pour tout projet: {pattern} (rien ajouté)")
+        return 0
+
+    try:
+        added = add_project_blocked_patterns(conn, project.id, [pattern])
+    except ValueError as exc:
+        conn.close()
+        print(f"[FAILED] {exc}")
+        return 1
+    conn.close()
+
+    if not added:
+        print(f"[VERIFIED] motif déjà présent pour {project.name}: {pattern} (rien ajouté)")
+        return 0
+
+    append_jsonl_event(
+        _logs_dir(),
+        component="cli.project_protect",
+        event="motif protégé ajouté",
+        level="INFO",
+        status=LogStatus.VERIFIED.value,
+        task_id=None,
+        details={"project_id": project.id, "project_name": project.name, "pattern": pattern},
+    )
+    print(f"[VERIFIED] motif protégé ajouté pour {project.name}: {pattern}")
+    return 0
+
+
+def cmd_project_protect_list(args: argparse.Namespace) -> int:
+    conn = _connect()
+    project = _get_project_by_name_or_id(conn, args.project)
+    conn.close()
+    if project is None:
+        print(f"[FAILED] projet introuvable: {args.project}")
+        return 1
+
+    if project.extra_blocked_patterns is None:
+        print(
+            f"[FAILED] valeur extra_blocked_patterns illisible pour {project.name} — tout diff de ce "
+            "projet sera classé MANUAL_REQUIRED jusqu'à correction manuelle"
+        )
+        return 1
+
+    print(
+        f"[VERIFIED] chemins protégés pour {project.name} ({len(DEFAULT_BLOCKED_PATTERNS)} par défaut, "
+        f"{len(project.extra_blocked_patterns)} ajouté(s) au projet):"
+    )
+    for p in DEFAULT_BLOCKED_PATTERNS:
+        print(f"  [défaut] {p}")
+    for p in project.extra_blocked_patterns:
+        print(f"  [projet] {p}")
     return 0
 
 
@@ -1032,7 +1135,11 @@ def cmd_sync_push(args: argparse.Namespace) -> int:
 
     fingerprint = diff_fingerprint(head_commit, upstream)
     tests_passed = _herbert_tests_pass()
-    classification = classify_push(files_changed, total_diff_lines, tests_passed)
+    # Portée HERBERT lui-même (REPO_ROOT n'est pas un projet enregistré) :
+    # défauts + chemins propres à HERBERT, jamais la liste d'un projet cible.
+    classification = classify_push(
+        files_changed, total_diff_lines, tests_passed, blocked_patterns=HERBERT_BLOCKED_PATTERNS
+    )
 
     classify_log_details = {
         "branch": branch,
@@ -1166,6 +1273,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="outrepasse le refus si des tâches non archivées existent (confirmation explicite requise)",
     )
     project_archive.set_defaults(func=cmd_project_archive)
+
+    project_protect = project_sub.add_parser(
+        "protect", help="chemins protégés par classify_push pour un projet (ajout seulement, jamais de retrait)"
+    )
+    protect_sub = project_protect.add_subparsers(dest="protect_command", required=True)
+    protect_add = protect_sub.add_parser(
+        "add", help="ajoute un motif protégé (préfixe ancré racine, ou **/<glob> sur le nom de fichier)"
+    )
+    protect_add.add_argument("project", help="nom ou id du projet")
+    protect_add.add_argument("pattern")
+    protect_add.set_defaults(func=cmd_project_protect_add)
+    protect_list = protect_sub.add_parser("list", help="liste les motifs protégés effectifs (défauts + projet)")
+    protect_list.add_argument("project", help="nom ou id du projet")
+    protect_list.set_defaults(func=cmd_project_protect_list)
 
     task_parser = subparsers.add_parser("task", help="gestion des tâches")
     task_sub = task_parser.add_subparsers(dest="task_command", required=True)

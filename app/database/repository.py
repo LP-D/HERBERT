@@ -28,11 +28,39 @@ def _utc_now_iso() -> str:
 # --- projects ---------------------------------------------------------
 
 def insert_project(conn: sqlite3.Connection, project: Project) -> None:
+    extras = project.extra_blocked_patterns
+    if extras is None:
+        # None = "valeur stockée illisible" (voir Project) : l'écrire en NULL
+        # la transformerait silencieusement en "défauts seuls".
+        raise ValueError("extra_blocked_patterns=None ne peut pas être inséré (marqueur de valeur illisible)")
     conn.execute(
-        "INSERT INTO projects (id, name, path, created_at) VALUES (?, ?, ?, ?)",
-        (project.id, project.name, project.path, project.created_at.isoformat()),
+        "INSERT INTO projects (id, name, path, created_at, extra_blocked_patterns) VALUES (?, ?, ?, ?, ?)",
+        (
+            project.id,
+            project.name,
+            project.path,
+            project.created_at.isoformat(),
+            json.dumps(extras, ensure_ascii=False) if extras else None,
+        ),
     )
     conn.commit()
+
+
+def _parse_extra_blocked_patterns(raw: str | None) -> list[str] | None:
+    """NULL -> [] (aucun ajout, défauts seuls). JSON invalide ou autre chose
+    qu'une liste de chaînes non vides -> None, JAMAIS une liste vide
+    « réparée » : resolve_blocked_patterns en déduit alors une résolution
+    échouée (MANUAL_REQUIRED), et le reste de HERBERT (listing, dashboard)
+    continue de fonctionner au lieu de lever sur ce projet."""
+    if raw is None:
+        return []
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, list) or not all(isinstance(p, str) and p.strip() for p in value):
+        return None
+    return value
 
 
 def _project_from_row(row: sqlite3.Row) -> Project:
@@ -42,7 +70,33 @@ def _project_from_row(row: sqlite3.Row) -> Project:
         path=row["path"],
         created_at=row["created_at"],
         archived_at=row["archived_at"],
+        extra_blocked_patterns=_parse_extra_blocked_patterns(row["extra_blocked_patterns"]),
     )
+
+
+def add_project_blocked_patterns(conn: sqlite3.Connection, project_id: str, patterns: list[str]) -> list[str]:
+    """Ajout STRICT : fusionne `patterns` avec l'existant (doublons ignorés,
+    ordre préservé) — aucun chemin de code ne retire ni ne remplace un motif.
+    Retourne les motifs réellement ajoutés (vide si tous étaient déjà là).
+    Refuse (ValueError) si la valeur déjà stockée est illisible : l'écraser
+    serait un remplacement silencieux, pas un ajout."""
+    row = conn.execute("SELECT extra_blocked_patterns FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"projet introuvable: {project_id}")
+    current = _parse_extra_blocked_patterns(row["extra_blocked_patterns"])
+    if current is None:
+        raise ValueError(
+            "valeur extra_blocked_patterns stockée illisible — refus d'écraser (ajout seulement), "
+            "correction manuelle requise"
+        )
+    added = [p for p in dict.fromkeys(patterns) if p not in current]
+    if added:
+        conn.execute(
+            "UPDATE projects SET extra_blocked_patterns = ? WHERE id = ?",
+            (json.dumps(current + added, ensure_ascii=False), project_id),
+        )
+        conn.commit()
+    return added
 
 
 def get_project_by_name(conn: sqlite3.Connection, name: str) -> Project | None:
