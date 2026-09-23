@@ -111,6 +111,18 @@ POLICY: list[PolicyRule] = [
         "modification des chemins protégés par classify_push (réservé à un humain hors session agent)",
         hook_regex=r"\bproject\s+protect\b",
     ),
+    # `engine init-hooks` (re)génère le fichier settings qui porte les hooks
+    # HERBERT d'un projet cible : même principe et même modèle que
+    # engine_project_protect — un agent contraint ne redéploie jamais ses
+    # propres contraintes. Même faux positif accepté (texte littéral dans
+    # n'importe quelle commande Bash, ex. message de commit -> `git commit -F`).
+    # `init_hooks` (souligné, ex. tests/unit/test_init_hooks.py) n'est pas visé.
+    PolicyRule(
+        "engine_init_hooks",
+        PolicyLevel.BLOCKED_OR_HUMAN_REQUIRED,
+        "(re)déploiement des hooks HERBERT d'un projet (réservé à un humain hors session agent)",
+        hook_regex=r"\binit-hooks\b",
+    ),
     # Déclarée ici pour documentation/cohérence du message, mais PAS incluse
     # dans generate_hook_patterns() : logique dédiée par segment dans le
     # hook (voir docstring du module).

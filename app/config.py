@@ -77,6 +77,7 @@ def write_default_config(path: str | Path) -> Path:
         "  model: claude-sonnet-5\n"
         "  max_iterations: 3\n"
         "  timeout_seconds: 600\n"
+        "  # executable: <chemin ABSOLU de claude.exe> (obligatoire pour `engine task run-headless`)\n"
     )
     path.write_text(content, encoding="utf-8")
     return path

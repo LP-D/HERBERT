@@ -6,6 +6,19 @@ un dépôt personnel quelconque sur lequel on veut que Claude Code passe
 par les mêmes garde-fous (CommandPolicy, PathPolicy, journalisation)
 que ceux utilisés pour développer HERBERT lui-même.
 
+> **Sessions headless (`engine task run-headless`) — depuis le 2026-09-23 :**
+> aucun `.claude/settings.json` n'est nécessaire (ni lu) dans le projet
+> cible. Les hooks viennent d'un fichier généré par HERBERT sous
+> `data/target_settings/<project_id>/settings.json` (commande manuelle :
+> `engine init-hooks <chemin-projet>`, aussi exécutée automatiquement avant
+> chaque boucle), chargé via `--settings <fichier> --setting-sources ""` —
+> seule source chargée, donc aucun `disableAllHooks` du projet ne peut les
+> neutraliser. Prérequis : `claude_headless.executable` dans
+> `config/system.yaml` (chemin absolu de `claude.exe`). Voir
+> docs/DECISIONS.md, « Isolation headless et init-hooks ». La procédure
+> ci-dessous reste celle des sessions **interactives** ouvertes dans un
+> projet cible.
+
 ## Principe général : un seul HERBERT, plusieurs projets surveillés
 
 HERBERT n'est **pas** installé dans chaque projet cible. Il n'existe

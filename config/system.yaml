@@ -14,3 +14,7 @@ claude_headless:
   model: claude-sonnet-5
   max_iterations: 3
   timeout_seconds: 600
+  # Chemin ABSOLU du binaire natif claude.exe — jamais `claude` nu (sans
+  # shell, FileNotFoundError) ni claude.cmd (cmd.exe tronque le prompt au
+  # premier retour à la ligne). Vérifié par `--version` au démarrage.
+  executable: C:/Users/Dufour/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe

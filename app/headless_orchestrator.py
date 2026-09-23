@@ -13,13 +13,26 @@ l'attribution task_id des hooks.
 Invariant non négociable : ce module n'appelle JAMAIS `push_to_origin`,
 directement ou indirectement — `engine sync push` reste l'unique porte
 vers un push réel (voir README.md, docs/DECISIONS.md).
+
+Hooks : avant la boucle, le fichier settings HERBERT du projet est
+(re)déployé par app/hooks_deploy.py et passé à chaque invocation
+(`--settings <fichier> --setting-sources ""`). Son SHA-256 est revérifié
+après CHAQUE invocation (défense en profondeur : le fichier est hors du
+répertoire de travail de l'agent, mais une commande Bash n'est pas
+contrôlée par PathPolicy) — toute modification = BLOCKED.
+
+Panne d'infrastructure (InvocationInfrastructureError : le process claude
+n'a pas pu être lancé, ou a signalé l'échec d'authentification littéral
+AUTH_FAILURE_LITERAL) : tâche BLOCKED avec la raison exacte, aucune
+itération consommée, pytest non lancé, exception propagée à l'appelant.
 """
 import argparse
 import sqlite3
 
 from app.active_task import activate_task, deactivate_task_if_active
-from app.claude_headless import build_context_prompt, invoke_claude_headless
+from app.claude_headless import InvocationInfrastructureError, build_context_prompt, invoke_claude_headless
 from app.cli.main import _regenerate_dashboard, cmd_task_test
+from app.hooks_deploy import HooksDeployError, deploy_target_settings, sha256_file
 from app.database.repository import (
     get_latest_audit_log_details,
     get_latest_test_result_for_task,
@@ -42,10 +55,12 @@ from app.state_machine.states import TaskState
 # tâche — jamais une réactivation silencieuse.
 _RESUMABLE_STATES = {TaskState.RECEIVED, TaskState.EXECUTING, TaskState.FAILED}
 
-# Invocation "allée mal" (par opposition à un vrai échec de tests) —
-# consomme quand même une itération sur le plafond (voir docs/DECISIONS.md,
-# point 4c : uniforme, pas de court-circuit spécial, aucun coût réel à
-# distinguer "binaire introuvable" du reste).
+# Le process claude a TOURNÉ mais l'invocation est "allée mal" (par
+# opposition à un vrai échec de tests) — consomme une itération sur le
+# plafond (docs/DECISIONS.md, point 4c, amendé : un process qui ne démarre
+# même pas n'est plus traité ici mais par InvocationInfrastructureError,
+# fatale, sans itération consommée). NOT_EXECUTED n'est plus produit par
+# invoke_claude_headless, conservé pour les lignes historiques.
 _INVOCATION_PROBLEM_STATUSES = {
     HeadlessInvocationStatus.NOT_EXECUTED,
     HeadlessInvocationStatus.TIMED_OUT,
@@ -67,14 +82,37 @@ def _headless_reason_for(invocation, iteration_number: int, max_iterations: int)
     return None
 
 
+def _block(conn, task_id, logs_dir, reason: str, trigger: str, event: str, details: dict):
+    transition_task(conn, task_id, TaskState.BLOCKED, reason=reason, is_human_decision=False)
+    deactivate_task_if_active(conn, task_id, logs_dir, trigger=trigger)
+    append_jsonl_event(
+        logs_dir,
+        component="headless_orchestrator",
+        event=event,
+        level="ERROR",
+        status=LogStatus.BLOCKED.value,
+        task_id=task_id,
+        details={"reason": reason, **details},
+    )
+    _regenerate_dashboard(conn)
+
+
 def run_headless_task(
     conn: sqlite3.Connection,
     task_id: str,
     logs_dir,
     model: str,
+    *,
+    executable: str,
+    herbert_root,
     max_iterations: int = 3,
     timeout_seconds: int = 600,
 ):
+    """`executable` : chemin absolu déjà validé par
+    app/claude_headless.py::validate_claude_executable (au démarrage de la
+    commande CLI). `herbert_root` : racine HERBERT sous laquelle vit le
+    fichier settings du projet (data/target_settings/<project_id>/) et
+    d'où les hooks sont référencés — obligatoire, jamais implicite."""
     task = get_task(conn, task_id)
     if task is None:
         raise HeadlessOrchestrationError(f"tâche introuvable: {task_id}")
@@ -105,6 +143,15 @@ def run_headless_task(
             f"plafond atteint lors d'une exécution précédente, jamais de tentative supplémentaire silencieuse"
         )
 
+    # Avant toute itération (et avant toute transition) : sans fichier
+    # settings HERBERT valide, l'agent ne tourne jamais.
+    try:
+        deployment = deploy_target_settings(project, herbert_root, logs_dir)
+    except HooksDeployError as exc:
+        raise HeadlessOrchestrationError(
+            f"hooks HERBERT non déployables pour ce projet ({exc}) — voir `engine init-hooks {project.path}`"
+        ) from exc
+
     activate_task(conn, task_id, logs_dir)
 
     previous_failure = get_latest_test_result_for_task(conn, task_id)
@@ -115,7 +162,59 @@ def run_headless_task(
             transition_task(conn, task_id, TaskState.EXECUTING, is_human_decision=False)
 
         prompt = build_context_prompt(task.description, project, candidate_branch, previous_failure)
-        invocation = invoke_claude_headless(prompt, cwd=project.path, model=model, timeout_seconds=timeout_seconds)
+        try:
+            invocation = invoke_claude_headless(
+                prompt,
+                cwd=project.path,
+                model=model,
+                timeout_seconds=timeout_seconds,
+                executable=executable,
+                settings_path=str(deployment.path),
+            )
+        except InvocationInfrastructureError as exc:
+            _block(
+                conn, task_id, logs_dir,
+                reason=(
+                    f"panne d'invocation (infrastructure, pas un échec de tâche) : {exc} — "
+                    f"aucune itération consommée, pytest non lancé"
+                ),
+                trigger="headless_invocation_infrastructure",
+                event="panne d'invocation headless (infrastructure)",
+                details={"iteration_attempted": i, "executable": executable},
+            )
+            raise
+
+        current_sha = sha256_file(deployment.path)
+        if current_sha != deployment.sha256:
+            # L'itération a bien eu lieu (l'agent a tourné) : elle est
+            # enregistrée, mais son résultat n'est pas fiable — pytest n'est
+            # pas lancé, la tâche est bloquée.
+            insert_headless_iteration(
+                conn,
+                HeadlessIteration(
+                    task_id=task_id,
+                    iteration_number=i,
+                    prompt_sent=prompt,
+                    raw_result=invocation.raw_stdout,
+                    session_id=invocation.session_id,
+                    num_turns=invocation.num_turns,
+                    invocation_status=invocation.invocation_status,
+                    tests_passed=False,
+                ),
+            )
+            _block(
+                conn, task_id, logs_dir,
+                reason=(
+                    f"intégrité : fichier settings HERBERT modifié pendant l'itération {i}/{max_iterations} "
+                    f"(sha256 attendu {deployment.sha256}, trouvé {current_sha}) — résultat non fiable, pytest non lancé"
+                ),
+                trigger="headless_settings_integrity",
+                event="intégrité du fichier settings HERBERT rompue",
+                details={"iteration": i, "path": str(deployment.path), "expected_sha256": deployment.sha256,
+                         "found_sha256": current_sha},
+            )
+            return get_task(conn, task_id)
+
         headless_reason = _headless_reason_for(invocation, i, max_iterations)
 
         # Tourne quand même après un problème d'invocation : signal honnête

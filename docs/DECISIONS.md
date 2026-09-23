@@ -268,6 +268,17 @@ qu'elle contraint. Limites, documentées plutôt que cachées :
 
 ### Timeout et crash d'invocation : traitement uniforme
 
+> **AMENDÉ le 2026-09-23** (voir « Décision — Isolation headless et
+> init-hooks » ci-dessous) : un binaire introuvable n'est PAS une tentative
+> « ratée avant même de commencer » au coût négligeable — c'est une panne
+> d'infrastructure permanente qui, sur cette machine, rendait CHAQUE
+> invocation impossible. Elle est désormais fatale
+> (`InvocationInfrastructureError`), sans itération consommée ni pytest.
+> Même statut pour l'échec d'authentification (motif littéral unique, voir
+> plus bas). Le traitement uniforme ci-dessous reste valable pour tout
+> autre process qui a réellement tourné (timeout, JSON illisible, tout
+> autre `is_error: true`).
+
 Un timeout (`config/system.yaml:claude_headless.timeout_seconds`, 600s
 par défaut) ou un crash d'invocation (binaire introuvable, JSON
 illisible, `is_error: true` renvoyé par Claude Code) consomment CHACUN
@@ -299,6 +310,25 @@ prompt (`build_context_prompt`) suit le principe général déjà énoncé
 un prompt gigantesque) sans dépendre de cette source.
 
 ### Vérification live — CONFIRMÉE (2026-09-05, après `claude auth login`)
+
+> **REQUALIFIÉ le 2026-09-23 — NON VÉRIFIÉ sur cet environnement.** Sur
+> cette machine (Windows, Claude Code 2.1.235 installé par npm), le code
+> V0.6 lançait `claude` NU via `subprocess.run` sans shell : aucun
+> `claude.exe` n'est sur le PATH (seulement le script npm `claude` et
+> `claude.cmd`), Windows ne complète qu'en `.exe`, donc
+> `FileNotFoundError [WinError 2]` à CHAQUE appel — reproduit le
+> 2026-09-23 (E8), aucune exécution headless n'a jamais pu réussir ici
+> avant ce correctif. Les preuves citées ci-dessous (session
+> `47dc0561…`, task `f621272d…`, `logs/herbert-2026-09-05.jsonl`) sont
+> introuvables sur cette machine : aucun fichier JSONL de septembre
+> antérieur au 23, tâche absente de `data/herbert.db`. Elles ont
+> vraisemblablement été produites dans un autre environnement (clone
+> distinct, `data/` et `logs/` étant exclus du dépôt). Le texte est
+> conservé tel quel, pas supprimé. Le chemin réel est prouvé sur cette
+> machine depuis le 2026-09-23 par tests/integration/test_real_claude_headless.py.
+> Par ailleurs, la conclusion « les hooks du projet cible s'appliquent en
+> headless » est vraie mais insuffisante : un `disableAllHooks` du projet
+> les neutralise (E3, E6) — voir la décision suivante.
 
 Les deux vérifications marquées obligatoires ont d'abord été bloquées par
 un défaut d'authentification (`claude -p ... --output-format json`
@@ -339,3 +369,118 @@ interactive — confirmé empiriquement, pas supposé. La couverture unitaire
 (`tests/unit/test_claude_headless.py`, `tests/unit/test_headless_orchestrator.py`,
 subprocess simulé) reste la couverture de régression ; ces deux
 vérifications live en sont le complément ponctuel, désormais fait.
+
+## Décision — Isolation headless et init-hooks (2026-09-23)
+
+### Ce qui a été découvert (2026-09-23, expériences réelles, scratchpad jetable)
+
+Banc : dépôt git jetable, hook témoin `A_project` dans son
+`.claude/settings.json`, hook témoin `S_external` dans un fichier séparé
+passé par `--settings`, chacun journalisant ses appels et bloquant
+(exit 2) `touch verify_marker`. Chaque run vérifié `is_error=False` et
+modèle réellement exécuté avant toute conclusion.
+
+| Exp. | Configuration | Résultat |
+|---|---|---|
+| E0 | projet seul | bloqué par A_project |
+| E3 | `settings.local.json` = `disableAllHooks` | aucun hook, commande exécutée |
+| E1 | E3 + `--settings` | aucun hook — `--settings` seul n'isole PAS |
+| E2 | E1 + `--setting-sources project` | bloqué — `local` exclu |
+| E4 | `--settings` externe | A_project ET S_external appelés — `--settings` s'AJOUTE |
+| E5 | local hostile + `--settings` + `--setting-sources project` | les deux hooks appelés |
+| E6 | `disableAllHooks` dans le settings.json DU PROJET + `--setting-sources project` | aucun hook — un agent qui édite le settings.json de son propre projet neutralise tout |
+| E7a | projet ET local hostiles + `--setting-sources ""` | SEUL S_external appelé, bloqué |
+| E7b | `--setting-sources none` | refusé par le CLI (`Invalid setting source: none`) |
+| E8 | `subprocess.run(["claude", ...])` (le code V0.6) | `FileNotFoundError [WinError 2]` |
+| E8′ | même liste avec `claude.CMD` résolu, prompt 1 ligne | identique à E7a |
+| — | argument multi-lignes passé à un `.cmd` | tronqué au 1er retour à la ligne, arguments suivants PERDUS, code 0 |
+| E9 | `claude.exe` natif direct, prompt 4 lignes, config hostile | prompt reçu identique octet pour octet (hook UserPromptSubmit), seul S_external |
+| E11 | E9 avec `%USERNAME% & \| > ^ "…"` | reçu identique, rien interprété, aucun fichier de redirection |
+
+Hors banc : `claude.cmd` (npm) ne fait que lancer
+`node_modules/@anthropic-ai/claude-code/bin/claude.exe` (binaire natif,
+pas de `cli.js`).
+
+### Ce qui est retenu
+
+- **Invocation** : `claude.exe` natif par son chemin ABSOLU
+  (`config/system.yaml`, `claude_headless.executable`), liste d'arguments,
+  `shell=False`, jamais `claude` nu (E8), jamais `claude.cmd` (troncature
+  silencieuse par cmd.exe — limite connue, **évitée par construction**
+  puisqu'aucun shell n'intervient plus). Validé au démarrage de
+  `engine task run-headless` par `--version` réellement exécuté ;
+  configuration invalide = erreur fatale nommant la clé, avant de toucher
+  la moindre tâche.
+- **Isolation** : `--settings <fichier HERBERT> --setting-sources ""`
+  (E7a, E9, E11). Aucune source project/local/user n'est chargée : ni
+  `disableAllHooks` du projet cible, ni celui de son `settings.local.json`
+  ne peuvent désactiver les hooks HERBERT.
+- **Fichier settings** : généré par `app/hooks_deploy.py` sous
+  `data/target_settings/<project_id>/settings.json`, JAMAIS dans le dépôt
+  cible (plus de collision avec un settings.json personnel, pas de
+  `--force`). Contenu complet et autosuffisant (permissions de
+  `generate_settings_permissions()` + hooks absolus, `sys.executable`,
+  séparateurs `/`), puisqu'aucune autre source n'est chargée. Idempotent,
+  écriture atomique relue, SHA-256 en JSONL (`task_id=None`), aucune
+  métadonnée dans le fichier. Déployé automatiquement avant chaque
+  boucle headless, ou à la main par `engine init-hooks <chemin>`.
+  Refusé si le fichier tomberait dans le projet (ex. projet enregistré
+  sur HERBERT lui-même).
+- **Intégrité** : SHA-256 du fichier revérifié après chaque invocation ;
+  différence = itération enregistrée, pytest non lancé, tâche BLOCKED.
+  Défense en profondeur : le fichier est hors du répertoire de travail
+  de l'agent (PathPolicy refuse Write/Edit), mais une commande Bash n'est
+  pas soumise à PathPolicy.
+- **Panne d'infrastructure vs échec de tâche** : `NOT_EXECUTED` n'est plus
+  un résultat d'itération. Un process qui ne démarre pas lève
+  `InvocationInfrastructureError` : tâche BLOCKED avec la raison exacte,
+  aucune itération consommée, pytest non lancé, erreur propagée. La
+  décision 4c (« traitement uniforme ») supposait qu'un binaire absent
+  était un cas ponctuel au coût négligeable ; c'était en fait une panne
+  permanente, invisible parce que TOUTE la suite remplaçait
+  `subprocess.run` et `invoke_claude_headless` par des doublures. D'où le
+  test d'intégration réelle opt-in
+  (`HERBERT_REAL_CLAUDE=1 python -m pytest tests/integration -s`, ~0,03-0,07 $).
+  **Échec d'authentification** : également une panne d'infrastructure
+  (relancer l'agent n'y peut rien, `claude auth login` est une action
+  humaine) — mais uniquement sur le motif LITTÉRAL
+  `Failed to authenticate: OAuth session expired and could not be refreshed`
+  avec `is_error: true`. Choisi parce que c'est la seule chaîne d'échec
+  d'auth à la fois présente telle quelle dans le binaire claude.exe
+  2.1.235 (extraction des chaînes du binaire, 2026-09-23) ET observée
+  réellement dans le champ `result` d'une sortie `-p --output-format json`
+  (3 fois : 2026-09-05, deux fois le 2026-09-23). Les autres chaînes du
+  binaire (`Failed to authenticate. ${…}: ${…}`,
+  `Failed to authenticate through the broker: ${…}`, `Failed to
+  authenticate` seul) n'ont jamais été observées dans ce contexte :
+  volontairement exclues, jamais un `is_error` générique ni un motif
+  deviné. Tout autre process qui a tourné (timeout, JSON illisible, tout
+  autre `is_error`) garde le traitement uniforme.
+- **CommandPolicy** : règle `engine_init_hooks` (regex `\binit-hooks\b`,
+  hook uniquement), même modèle et même faux positif accepté que
+  `engine_project_protect`. En headless, elle s'applique nécessairement :
+  le fichier HERBERT est la seule source chargée.
+
+### Limites connues (documentées, pas corrigées dans ce lot — même statut que le `sleep` de 30 s+)
+
+- **NotebookEdit hors PathPolicy** : le matcher des hooks est
+  `Bash|Write|Edit` ; un outil d'écriture non couvert (NotebookEdit)
+  n'est pas soumis à PathPolicy.
+- **Écriture arbitraire via Bash** : `python -c "open(...).write(...)"`,
+  ou tout interpréteur lancé en Bash, écrit où il veut — le détecteur
+  settings.json et PathPolicy ne voient que des cibles textuelles
+  (redirections, cp/mv/rm…). Le contrôle SHA-256 ci-dessus couvre le
+  fichier settings HERBERT, pas le reste du disque.
+- **Détecteur settings.json (sessions interactives)** : ne voit pas la
+  SOURCE d'un `mv .claude/settings.json ailleurs`, ne protège pas
+  `settings.local.json`, et résout les chemins relatifs par rapport au
+  `cwd` de la session sans tenir compte d'un `cd` dans la commande
+  (constaté le 2026-09-23 : faux positif dans un sens, cible réelle
+  différente dans l'autre). Sans effet en headless (sources project/local
+  non chargées), pertinent pour les sessions interactives ouvertes dans
+  un projet cible.
+- **Source `user` et `--setting-sources ""`** : exclusion de
+  `~/.claude/settings.json` déduite, non vérifiée directement ; le
+  `--help` du CLI 2.1.235 ne documente pas le cas de la liste vide.
+- **Ordre des arguments** : seul l'ordre utilisé (prompt juste après
+  `-p`, options ensuite) a été testé en réel.

@@ -20,6 +20,9 @@ from app.models.enums import HeadlessInvocationStatus
 from app.state_machine.states import TaskState
 
 MODEL = "claude-sonnet-5"
+# Jamais lancé : invoke_claude_headless est remplacé dans ces tests unitaires
+# (le vrai binaire est couvert par tests/integration/test_real_claude_headless.py).
+FAKE_EXE = "C:/fake/claude.exe"
 
 
 def _run_git(cwd, *args):
@@ -111,14 +114,14 @@ def test_success_on_first_iteration_auto(isolated_repo_root, tmp_path, monkeypat
     project_dir = _make_target_project(tmp_path, initial_value=2)
     task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         _fix_calc(project_dir)  # corrige ET committe dès la 1re invocation
         return _success_result()
 
     monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
 
     assert result_task.status == TaskState.DONE
     iterations = list_headless_iterations_for_task(conn, task.id)
@@ -136,7 +139,7 @@ def test_failure_then_success_second_iteration_includes_previous_failure_context
 
     calls = []
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         calls.append(prompt)
         if len(calls) == 2:
             _fix_calc(project_dir)
@@ -145,7 +148,7 @@ def test_failure_then_success_second_iteration_includes_previous_failure_context
     monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
 
     assert result_task.status == TaskState.DONE
     iterations = list_headless_iterations_for_task(conn, task.id)
@@ -165,13 +168,13 @@ def test_three_consecutive_failures_blocked_never_a_fourth_attempt(
     project_dir = _make_target_project(tmp_path, initial_value=2)  # jamais corrigé
     task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         return _success_result()  # invocation "réussie" mais ne corrige jamais calc.py
 
     monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, max_iterations=3)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root, max_iterations=3)
 
     assert result_task.status == TaskState.BLOCKED
     iterations = list_headless_iterations_for_task(conn, task.id)
@@ -188,7 +191,7 @@ def test_three_consecutive_failures_blocked_never_a_fourth_attempt(
     # Relancer l'orchestration sur cette même tâche doit être refusé, pas
     # silencieusement déclencher une 4e itération.
     with pytest.raises(HeadlessOrchestrationError):
-        run_headless_task(conn, task.id, logs_dir, model=MODEL, max_iterations=3)
+        run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root, max_iterations=3)
     assert len(list_headless_iterations_for_task(conn, task.id)) == 3
     conn.close()
 
@@ -199,14 +202,14 @@ def test_success_manual_required_classification_stops_at_human_required(
     project_dir = _make_target_project(tmp_path, initial_value=2)
     task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         _bloat_calc(project_dir)  # tests passent, mais diff > 20 lignes -> MANUAL_REQUIRED
         return _success_result()
 
     monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
 
     assert result_task.status == TaskState.HUMAN_REQUIRED
 
@@ -241,7 +244,7 @@ def test_agent_gaming_tests_via_conftest_is_human_required(isolated_repo_root, t
     project_dir = _make_target_project(tmp_path, initial_value=2)
     task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         (project_dir / "conftest.py").write_text("import calc\ncalc.value = lambda: 1\n", encoding="utf-8")
         _run_git(project_dir, "add", "-A")
         _run_git(project_dir, "commit", "-m", "tests verts (via conftest)")
@@ -250,7 +253,7 @@ def test_agent_gaming_tests_via_conftest_is_human_required(isolated_repo_root, t
     monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
 
     assert result_task.status == TaskState.HUMAN_REQUIRED
     reason = _human_required_reason(conn, task.id)
@@ -263,7 +266,7 @@ def test_agent_touching_env_file_is_human_required(isolated_repo_root, tmp_path,
     project_dir = _make_target_project(tmp_path, initial_value=2)
     task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         (project_dir / "config").mkdir()
         (project_dir / "config" / ".env").write_text("API_KEY=xyz\n", encoding="utf-8")
         _fix_calc(project_dir)  # committe calc.py ET config/.env
@@ -272,7 +275,7 @@ def test_agent_touching_env_file_is_human_required(isolated_repo_root, tmp_path,
     monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
 
     assert result_task.status == TaskState.HUMAN_REQUIRED
     assert "chemin sensible: config/.env" in _human_required_reason(conn, task.id)
@@ -287,7 +290,7 @@ def test_unreadable_project_patterns_force_human_required_on_otherwise_auto_diff
     project_dir = _make_target_project(tmp_path, initial_value=2)
     task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         _fix_calc(project_dir)
         return _success_result()
 
@@ -296,7 +299,7 @@ def test_unreadable_project_patterns_force_human_required_on_otherwise_auto_diff
     conn = get_connection(_db_path(isolated_repo_root))
     conn.execute("UPDATE projects SET extra_blocked_patterns = ? WHERE id = ?", ("{cassé", project.id))
     conn.commit()
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
 
     assert result_task.status == TaskState.HUMAN_REQUIRED
     assert "liste de chemins protégés non résolue" in _human_required_reason(conn, task.id)
@@ -307,7 +310,7 @@ def test_timeout_iteration_has_distinct_reason_and_consumes_budget(isolated_repo
     project_dir = _make_target_project(tmp_path, initial_value=2)
     task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         return HeadlessInvocationResult(
             invocation_status=HeadlessInvocationStatus.TIMED_OUT,
             error_detail=f"invocation headless expirée après {timeout_seconds}s",
@@ -316,7 +319,7 @@ def test_timeout_iteration_has_distinct_reason_and_consumes_budget(isolated_repo
     monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, max_iterations=3, timeout_seconds=42)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root, max_iterations=3, timeout_seconds=42)
 
     assert result_task.status == TaskState.BLOCKED
     iterations = list_headless_iterations_for_task(conn, task.id)
@@ -336,7 +339,7 @@ def test_invocation_crash_has_distinct_reason_and_consumes_budget(isolated_repo_
     project_dir = _make_target_project(tmp_path, initial_value=2)
     task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         return HeadlessInvocationResult(
             invocation_status=HeadlessInvocationStatus.INVOCATION_FAILED,
             is_error=True,
@@ -347,7 +350,7 @@ def test_invocation_crash_has_distinct_reason_and_consumes_budget(isolated_repo_
     monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, max_iterations=3)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root, max_iterations=3)
 
     assert result_task.status == TaskState.BLOCKED
     iterations = list_headless_iterations_for_task(conn, task.id)
@@ -371,7 +374,7 @@ def test_run_headless_task_never_calls_push_to_origin(isolated_repo_root, tmp_pa
     def fail_if_called(*args, **kwargs):
         raise AssertionError("push_to_origin ne doit JAMAIS être appelé par headless_orchestrator")
 
-    def fake_invoke(prompt, cwd, model, timeout_seconds, permission_mode="bypassPermissions"):
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
         _fix_calc(project_dir)
         return _success_result()
 
@@ -379,6 +382,288 @@ def test_run_headless_task_never_calls_push_to_origin(isolated_repo_root, tmp_pa
     monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
 
     conn = get_connection(_db_path(isolated_repo_root))
-    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL)
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
     assert result_task.status == TaskState.DONE
+    conn.close()
+
+
+# --- CLI `engine task run-headless` : validation de l'exécutable au démarrage
+
+def test_cli_invalid_executable_config_is_fatal_before_touching_task(isolated_repo_root, tmp_path, monkeypatch, capsys):
+    """isolated_repo_root n'a pas de config/system.yaml -> DEFAULT_CONFIG,
+    sans `executable` : fatal, code 2, message nommant la clé, tâche intacte."""
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+    monkeypatch.setattr(
+        headless_orchestrator, "run_headless_task", lambda *a, **k: pytest.fail("aucune tâche ne doit être touchée")
+    )
+
+    exit_code = cli_main.cmd_task_run_headless(argparse.Namespace(task_id=task.id))
+
+    out = capsys.readouterr().out
+    assert exit_code == 2
+    assert "claude_headless.executable" in out and "fatal" in out
+    conn = get_connection(_db_path(isolated_repo_root))
+    assert get_task(conn, task.id).status == TaskState.RECEIVED
+    conn.close()
+
+
+def test_cli_passes_validated_executable_and_herbert_root(isolated_repo_root, tmp_path, monkeypatch, capsys):
+    from app import claude_headless
+
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+    monkeypatch.setattr(
+        claude_headless, "validate_claude_executable",
+        lambda configured: claude_headless.ClaudeExecutable(path="C:/x/claude.exe", version="2.1.235 (Claude Code)"),
+    )
+    received = {}
+
+    def fake_run_headless_task(conn, task_id, logs_dir, model, **kwargs):
+        received.update(kwargs)
+        return get_task(conn, task_id)
+
+    monkeypatch.setattr(headless_orchestrator, "run_headless_task", fake_run_headless_task)
+
+    cli_main.cmd_task_run_headless(argparse.Namespace(task_id=task.id))
+
+    assert received["executable"] == "C:/x/claude.exe"
+    assert received["herbert_root"] == isolated_repo_root
+    assert "--version` : 2.1.235 (Claude Code)" in capsys.readouterr().out
+
+
+def test_cli_reports_infrastructure_error_distinctly(isolated_repo_root, tmp_path, monkeypatch, capsys):
+    from app import claude_headless
+
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+    monkeypatch.setattr(
+        claude_headless, "validate_claude_executable",
+        lambda configured: claude_headless.ClaudeExecutable(path="C:/x/claude.exe", version="v"),
+    )
+
+    def raise_infra(*args, **kwargs):
+        raise claude_headless.InvocationInfrastructureError("impossible de lancer C:/x/claude.exe: FileNotFoundError")
+
+    monkeypatch.setattr(headless_orchestrator, "run_headless_task", raise_infra)
+
+    assert cli_main.cmd_task_run_headless(argparse.Namespace(task_id=task.id)) == 1
+    out = capsys.readouterr().out
+    assert "[BLOCKED] panne d'invocation (infrastructure, pas un échec de tâche)" in out
+    assert "aucune itération consommée" in out
+
+
+# --- Fichier settings HERBERT + panne d'infrastructure (init-hooks) -------
+
+def _count(conn, table, task_id):
+    return conn.execute(f"SELECT COUNT(*) FROM {table} WHERE task_id = ?", (task_id,)).fetchone()[0]
+
+
+def test_settings_file_deployed_under_herbert_data_and_passed_to_every_invocation(
+    isolated_repo_root, tmp_path, monkeypatch, logs_dir
+):
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+    received = []
+
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
+        received.append((executable, settings_path))
+        if len(received) == 2:
+            _fix_calc(project_dir)
+        return _success_result()
+
+    monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
+
+    expected = isolated_repo_root / "data" / "target_settings" / project.id / "settings.json"
+    assert result_task.status == TaskState.DONE
+    assert received == [(FAKE_EXE, str(expected))] * 2
+    assert expected.is_file()
+    assert not (project_dir / ".claude").exists()  # rien d'écrit dans le dépôt cible
+    conn.close()
+
+
+def test_infrastructure_error_blocks_immediately_without_iteration_or_pytest(
+    isolated_repo_root, tmp_path, monkeypatch, logs_dir
+):
+    from app.claude_headless import InvocationInfrastructureError
+
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+    calls = []
+
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
+        calls.append(1)
+        raise InvocationInfrastructureError("impossible de lancer C:/fake/claude.exe: FileNotFoundError: [WinError 2]")
+
+    def pytest_must_not_run(*args, **kwargs):
+        raise AssertionError("cmd_task_test ne doit jamais tourner après une panne d'infrastructure")
+
+    monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
+    monkeypatch.setattr(headless_orchestrator, "cmd_task_test", pytest_must_not_run)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    with pytest.raises(InvocationInfrastructureError):
+        run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
+
+    assert calls == [1]  # jamais de 2e tentative
+    assert get_task(conn, task.id).status == TaskState.BLOCKED
+    assert list_headless_iterations_for_task(conn, task.id) == []  # aucune itération consommée
+    assert _count(conn, "test_results", task.id) == 0  # pytest jamais lancé
+    row = conn.execute(
+        "SELECT from_state, reason FROM state_transitions WHERE task_id = ? AND to_state = 'BLOCKED'", (task.id,)
+    ).fetchone()
+    assert row["from_state"] == "EXECUTING"
+    assert "panne d'invocation (infrastructure, pas un échec de tâche)" in row["reason"]
+    assert "WinError 2" in row["reason"]
+    conn.close()
+
+
+def test_normal_invocation_problem_still_consumes_iteration_and_runs_pytest(
+    isolated_repo_root, tmp_path, monkeypatch, logs_dir
+):
+    """Non-régression : le process a TOURNÉ (is_error renvoyé par Claude
+    Code) -> comportement inchangé, une itération consommée, pytest lancé."""
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
+        return HeadlessInvocationResult(
+            invocation_status=HeadlessInvocationStatus.INVOCATION_FAILED, is_error=True,
+            error_detail="Reached max turns (4)", raw_stdout='{"type":"result","is_error":true}',
+        )
+
+    monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    result_task = run_headless_task(
+        conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root, max_iterations=1
+    )
+
+    assert result_task.status == TaskState.BLOCKED
+    assert len(list_headless_iterations_for_task(conn, task.id)) == 1
+    assert _count(conn, "test_results", task.id) == 1
+    conn.close()
+
+
+def _fake_claude_process(monkeypatch, is_error, result):
+    """Remplace UNIQUEMENT le lancement du process dans app.claude_headless
+    (pas subprocess.run global : git et pytest doivent rester réels) — le
+    vrai invoke_claude_headless parse la sortie, comme en production."""
+    import json
+    import types
+
+    from app import claude_headless
+
+    stdout = json.dumps({"type": "result", "is_error": is_error, "result": result})
+    fake_subprocess = types.SimpleNamespace(
+        run=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1 if is_error else 0, stdout=stdout, stderr=""),
+        TimeoutExpired=subprocess.TimeoutExpired,
+    )
+    monkeypatch.setattr(claude_headless, "subprocess", fake_subprocess)
+
+
+def test_real_auth_failure_output_blocks_immediately_without_iteration_or_pytest(
+    isolated_repo_root, tmp_path, monkeypatch, logs_dir
+):
+    from app.claude_headless import InvocationInfrastructureError
+
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+    _fake_claude_process(monkeypatch, True, "Failed to authenticate: OAuth session expired and could not be refreshed")
+
+    def pytest_must_not_run(*args, **kwargs):
+        raise AssertionError("cmd_task_test ne doit jamais tourner après un échec d'authentification")
+
+    monkeypatch.setattr(headless_orchestrator, "cmd_task_test", pytest_must_not_run)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    with pytest.raises(InvocationInfrastructureError):
+        run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
+
+    assert get_task(conn, task.id).status == TaskState.BLOCKED
+    assert list_headless_iterations_for_task(conn, task.id) == []  # 0 itération consommée
+    assert _count(conn, "test_results", task.id) == 0  # pytest jamais lancé
+    reason = conn.execute(
+        "SELECT reason FROM state_transitions WHERE task_id = ? AND to_state = 'BLOCKED'", (task.id,)
+    ).fetchone()["reason"]
+    assert "échec d'authentification" in reason and "claude auth login" in reason
+    conn.close()
+
+
+def test_legitimate_is_error_output_still_consumes_iteration_and_runs_pytest(
+    isolated_repo_root, tmp_path, monkeypatch, logs_dir
+):
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+    _fake_claude_process(monkeypatch, True, "Tests en échec : SyntaxError: invalid syntax (calc.py, line 2)")
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    result_task = run_headless_task(
+        conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root, max_iterations=1
+    )
+
+    iterations = list_headless_iterations_for_task(conn, task.id)
+    assert len(iterations) == 1
+    assert iterations[0].invocation_status == HeadlessInvocationStatus.INVOCATION_FAILED
+    assert _count(conn, "test_results", task.id) == 1  # pytest réellement lancé
+    assert result_task.status == TaskState.BLOCKED  # plafond (1) atteint, comportement inchangé
+    conn.close()
+
+
+def test_settings_file_modified_during_iteration_blocks_without_pytest(
+    isolated_repo_root, tmp_path, monkeypatch, logs_dir
+):
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+
+    def fake_invoke(prompt, cwd, model, timeout_seconds, executable, settings_path, permission_mode="bypassPermissions"):
+        # Simule un agent qui atteint le fichier HERBERT par une commande Bash
+        # (non contrôlée par PathPolicy) pour désactiver les hooks.
+        with open(settings_path, "w", encoding="utf-8") as f:
+            f.write('{"disableAllHooks": true}')
+        _fix_calc(project_dir)
+        return _success_result()
+
+    def pytest_must_not_run(*args, **kwargs):
+        raise AssertionError("résultat non fiable : pytest ne doit pas tourner")
+
+    monkeypatch.setattr(headless_orchestrator, "invoke_claude_headless", fake_invoke)
+    monkeypatch.setattr(headless_orchestrator, "cmd_task_test", pytest_must_not_run)
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    result_task = run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=isolated_repo_root)
+
+    assert result_task.status == TaskState.BLOCKED
+    iterations = list_headless_iterations_for_task(conn, task.id)
+    assert len(iterations) == 1 and iterations[0].tests_passed is False
+    reason = conn.execute(
+        "SELECT reason FROM state_transitions WHERE task_id = ? AND to_state = 'BLOCKED'", (task.id,)
+    ).fetchone()["reason"]
+    assert "intégrité : fichier settings HERBERT modifié" in reason
+    conn.close()
+
+
+def test_undeployable_settings_fails_before_any_iteration_or_transition(
+    isolated_repo_root, tmp_path, monkeypatch, logs_dir
+):
+    """herbert_root À L'INTÉRIEUR du projet (ex. projet enregistré sur
+    HERBERT lui-même) : le fichier settings tomberait dans le répertoire de
+    l'agent -> refus avant toute itération, tâche inchangée."""
+    project_dir = _make_target_project(tmp_path, initial_value=2)
+    task, project = _make_task_with_branch(isolated_repo_root, project_dir, monkeypatch)
+    monkeypatch.setattr(
+        headless_orchestrator, "invoke_claude_headless", lambda *a, **k: pytest.fail("ne doit jamais invoquer")
+    )
+
+    conn = get_connection(_db_path(isolated_repo_root))
+    status_before = get_task(conn, task.id).status
+    with pytest.raises(HeadlessOrchestrationError) as info:
+        run_headless_task(conn, task.id, logs_dir, model=MODEL, executable=FAKE_EXE, herbert_root=project_dir)
+
+    assert "init-hooks" in str(info.value)
+    assert get_task(conn, task.id).status == status_before
+    assert list_headless_iterations_for_task(conn, task.id) == []
     conn.close()

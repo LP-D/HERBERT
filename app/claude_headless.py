@@ -13,12 +13,32 @@ CLI `claude`, qui dépend de ~/.claude/settings.json et peut être "haiku" —
 insuffisant pour une boucle de correction de code réelle). Voir
 config/system.yaml, section claude_headless.model.
 
-Statuts honnêtes (HeadlessInvocationStatus, app/models/enums.py) : le
-process peut échouer de plusieurs façons distinctes (binaire introuvable,
-timeout, sortie non-JSON, erreur applicative renvoyée par Claude Code
-lui-même) — jamais réduites à un simple booléen, pour rester
-diagnosticable (voir app/pytest_runner.py pour le même principe côté
-tests).
+Exécutable : TOUJOURS le binaire natif `claude.exe` par son chemin ABSOLU
+(config/system.yaml, clé claude_headless.executable), validé une fois au
+démarrage de `engine task run-headless` par validate_claude_executable()
+— jamais `claude` nu (sans shell=True, Windows ne complète qu'en `.exe` :
+FileNotFoundError systématique sur une installation npm), jamais
+`claude.cmd` (le lanceur npm passe par cmd.exe, qui tronque TOUT ce qui
+suit le premier retour à la ligne d'un argument, y compris les options
+suivantes, silencieusement, code de sortie 0). Voir docs/DECISIONS.md.
+
+Isolation : `--settings <fichier HERBERT> --setting-sources ""` — seul le
+fichier généré par app/hooks_deploy.py est chargé ; aucun settings.json
+ni settings.local.json du projet cible (ni ~/.claude/settings.json) ne
+peut désactiver les hooks HERBERT (disableAllHooks). Établi par
+expériences réelles E0-E11, voir docs/DECISIONS.md.
+
+Deux catégories d'échec, jamais confondues :
+- panne d'INFRASTRUCTURE (le process n'a pas pu être lancé :
+  FileNotFoundError/OSError, exécutable ou settings non absolus/absents ;
+  OU il a tourné mais signale l'échec d'authentification
+  AUTH_FAILURE_LITERAL, motif littéral unique)
+  -> InvocationInfrastructureError levée, fatale pour la boucle ;
+- tout autre cas où le process a tourné -> HeadlessInvocationResult avec
+  un statut honnête (VERIFIED, INVOCATION_FAILED, TIMED_OUT, UNAVAILABLE),
+  comme avant — y compris tout autre is_error.
+`NOT_EXECUTED` n'est plus produit ici (conservé dans l'enum pour les
+lignes historiques de headless_iterations).
 """
 import json
 import subprocess
@@ -35,6 +55,78 @@ from app.models.enums import HeadlessInvocationStatus
 # absente). Une sortie qui ne contient pas au moins "type" et "is_error"
 # est traitée comme UNAVAILABLE plutôt que supposée conforme.
 _REQUIRED_JSON_KEYS = ("type", "is_error")
+
+# Échec d'authentification = panne d'infrastructure (action humaine
+# `claude auth login` requise, relancer l'agent ne peut rien changer).
+# Motif LITTÉRAL unique, strict : présent tel quel dans le binaire
+# claude.exe 2.1.235 ET observé réellement (3 fois, 2026-09-05 et
+# 2026-09-23) dans le champ `result` d'une sortie `-p --output-format json`
+# avec is_error=true. Les autres chaînes d'échec d'auth du binaire
+# ("Failed to authenticate. ${...}: ${...}", "... through the broker: ...")
+# n'ont jamais été observées dans ce contexte : volontairement NON incluses
+# (jamais un is_error générique, jamais un motif deviné).
+AUTH_FAILURE_LITERAL = "Failed to authenticate: OAuth session expired and could not be refreshed"
+
+CONFIG_KEY_EXECUTABLE = "claude_headless.executable"
+_VERSION_CHECK_TIMEOUT_SECONDS = 60
+
+
+class ClaudeExecutableConfigError(Exception):
+    """Configuration de l'exécutable invalide : fatale au démarrage, avant
+    de toucher la moindre tâche."""
+
+
+class InvocationInfrastructureError(Exception):
+    """Le process `claude` n'a pas pu être lancé : panne d'invocation, pas
+    un échec de tâche — ne consomme aucune itération, ne lance pas pytest."""
+
+
+@dataclass(frozen=True)
+class ClaudeExecutable:
+    path: str
+    version: str
+
+
+def validate_claude_executable(configured) -> ClaudeExecutable:
+    """Vérifie RÉELLEMENT l'exécutable configuré : chemin absolu, fichier
+    existant, extension .exe, puis `<exe> --version` exécuté et capturé
+    (code 0 + sortie non vide) — jamais supposé. Lève
+    ClaudeExecutableConfigError, message nommant la clé attendue."""
+    hint = (
+        f"renseignez `{CONFIG_KEY_EXECUTABLE}` dans config/system.yaml avec le chemin ABSOLU du binaire natif "
+        "claude.exe (ex. <npm root -g>/@anthropic-ai/claude-code/bin/claude.exe) — jamais `claude` nu ni claude.cmd"
+    )
+    if configured is None or not str(configured).strip():
+        raise ClaudeExecutableConfigError(f"clé `{CONFIG_KEY_EXECUTABLE}` absente ou vide — {hint}")
+    path = Path(str(configured).strip())
+    if not path.is_absolute():
+        raise ClaudeExecutableConfigError(f"`{CONFIG_KEY_EXECUTABLE}` n'est pas un chemin absolu ({path}) — {hint}")
+    if path.suffix.lower() != ".exe":
+        raise ClaudeExecutableConfigError(
+            f"`{CONFIG_KEY_EXECUTABLE}` doit viser un .exe, pas {path.name} (un .cmd tronque le prompt "
+            f"au premier retour à la ligne) — {hint}"
+        )
+    if not path.is_file():
+        raise ClaudeExecutableConfigError(f"`{CONFIG_KEY_EXECUTABLE}` introuvable sur le disque ({path}) — {hint}")
+    try:
+        proc = subprocess.run(
+            [str(path), "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_VERSION_CHECK_TIMEOUT_SECONDS,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClaudeExecutableConfigError(f"`{path} --version` n'a pas pu s'exécuter : {exc} — {hint}") from exc
+    version = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not version:
+        raise ClaudeExecutableConfigError(
+            f"`{path} --version` a échoué (code {proc.returncode}, stdout={version!r}, "
+            f"stderr={(proc.stderr or '').strip()[:200]!r}) — {hint}"
+        )
+    return ClaudeExecutable(path=str(path), version=version)
 
 
 @dataclass
@@ -95,33 +187,46 @@ def invoke_claude_headless(
     cwd: str | Path,
     model: str,
     timeout_seconds: int,
+    *,
+    executable: str,
+    settings_path: str | Path,
     permission_mode: str = "bypassPermissions",
 ) -> HeadlessInvocationResult:
-    """Lance `claude -p <prompt> --output-format json --model <model>
-    --permission-mode <permission_mode>` dans `cwd`, capture et parse la
-    sortie structurée.
+    """Lance le binaire `executable` (déjà validé par
+    validate_claude_executable) dans `cwd` avec une LISTE d'arguments, jamais
+    via un shell : les hooks chargés sont EXCLUSIVEMENT ceux de
+    `settings_path` (fichier HERBERT, voir app/hooks_deploy.py) grâce à
+    `--setting-sources ""`.
 
-    Ne lève jamais : toute défaillance (binaire absent, timeout, JSON
-    illisible) retourne un HeadlessInvocationResult avec un
-    invocation_status explicite — même pattern que
-    app/pytest_runner.py::run_pytest_for_project.
+    Lève InvocationInfrastructureError si le process ne peut pas être lancé
+    (ou si l'exécutable/les settings ne sont pas des chemins absolus
+    existants : lancer l'agent sans les hooks HERBERT n'est jamais une
+    option). Sinon ne lève pas : timeout, JSON illisible, erreur renvoyée
+    par Claude Code -> HeadlessInvocationResult avec un statut explicite
+    (même pattern que app/pytest_runner.py::run_pytest_for_project)."""
+    exe = Path(executable)
+    settings = Path(settings_path)
+    if not exe.is_absolute():
+        raise InvocationInfrastructureError(f"exécutable claude non absolu ({executable}) — jamais `claude` nu")
+    if not settings.is_absolute() or not settings.is_file():
+        raise InvocationInfrastructureError(
+            f"fichier settings HERBERT absent ou non absolu ({settings_path}) — refus de lancer l'agent sans hooks"
+        )
 
-    Les hooks PreToolUse/PostToolUse du projet cible (.claude/settings.json,
-    voir docs/DEPLOYMENT.md) s'appliquent identiquement en mode headless
-    qu'en session interactive — `--permission-mode` ne désactive que les
-    invites de confirmation natives de Claude Code, pas les hooks (vérifié
-    empiriquement, voir le test dédié dans tests/unit/test_claude_headless.py
-    et le test hooks-en-headless-via-HERBERT)."""
     argv = [
-        "claude",
+        str(exe),
         "-p",
         prompt,
+        "--settings",
+        str(settings),
+        "--setting-sources",
+        "",
         "--output-format",
         "json",
-        "--model",
-        model,
         "--permission-mode",
         permission_mode,
+        "--model",
+        model,
     ]
 
     try:
@@ -130,7 +235,10 @@ def invoke_claude_headless(
             cwd=cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds,
+            shell=False,
         )
     except subprocess.TimeoutExpired as exc:
         # subprocess.run tue le process avant de lever cette exception
@@ -142,11 +250,8 @@ def invoke_claude_headless(
             raw_stdout=partial_stdout,
             error_detail=f"invocation headless expirée après {timeout_seconds}s",
         )
-    except (FileNotFoundError, OSError) as exc:
-        return HeadlessInvocationResult(
-            invocation_status=HeadlessInvocationStatus.NOT_EXECUTED,
-            error_detail=f"impossible de lancer claude: {exc}",
-        )
+    except OSError as exc:  # FileNotFoundError, PermissionError, cwd invalide... : le process n'existe pas
+        raise InvocationInfrastructureError(f"impossible de lancer {exe}: {type(exc).__name__}: {exc}") from exc
 
     raw_stdout = proc.stdout or ""
 
@@ -167,6 +272,12 @@ def invoke_claude_headless(
         )
 
     is_error = bool(payload.get("is_error"))
+    result_text = payload.get("result")
+    if is_error and isinstance(result_text, str) and AUTH_FAILURE_LITERAL in result_text:
+        raise InvocationInfrastructureError(
+            f"échec d'authentification du CLI claude ({result_text.strip()[:200]!r}) — "
+            "`claude auth login` requis (action humaine), relancer l'agent ne changerait rien"
+        )
     status = HeadlessInvocationStatus.INVOCATION_FAILED if is_error else HeadlessInvocationStatus.VERIFIED
 
     return HeadlessInvocationResult(

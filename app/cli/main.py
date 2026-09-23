@@ -7,7 +7,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from app.active_task import activate_task, deactivate_task, deactivate_task_if_active  # noqa: E402
+from app.active_task import (  # noqa: E402
+    activate_task,
+    deactivate_task,
+    deactivate_task_if_active,
+    resolve_project_by_cwd,
+)
 from app.change_proof_builder import build_change_proof, detect_regressions  # noqa: E402
 from app.cli.doctor import run_all_checks  # noqa: E402
 from app.config import load_config, write_default_config  # noqa: E402
@@ -219,6 +224,41 @@ def cmd_project_list(args: argparse.Namespace) -> int:
     for p in projects:
         archived_suffix = f"  [ARCHIVÉ le {p.archived_at.isoformat()}]" if p.archived_at else ""
         print(f"[VERIFIED] {p.id}  {p.name}  {p.path}  {p.created_at.isoformat()}{archived_suffix}")
+    return 0
+
+
+def cmd_init_hooks(args: argparse.Namespace) -> int:
+    """`engine init-hooks <chemin-projet>` : (re)génère le fichier settings
+    HERBERT du projet enregistré à ce chemin, sous
+    data/target_settings/<project_id>/settings.json (jamais dans le dépôt
+    cible) — voir app/hooks_deploy.py. Idempotent. Bloquée par CommandPolicy
+    (règle engine_init_hooks) dans toute session où le hook HERBERT tourne :
+    réservée à un humain, depuis son propre terminal."""
+    from app.hooks_deploy import HooksDeployError, deploy_target_settings
+
+    conn = _connect()
+    project = resolve_project_by_cwd(conn, args.path)
+    conn.close()
+    if project is None:
+        print(
+            f"[FAILED] aucun projet enregistré pour ce chemin: {args.path} — "
+            "`engine project add --name ... --path ...` d'abord"
+        )
+        return 1
+
+    try:
+        result = deploy_target_settings(project, REPO_ROOT, _logs_dir())
+    except HooksDeployError as exc:
+        print(f"[FAILED] {exc}")
+        return 1
+
+    labels = {"created": "créé", "unchanged": "déjà à jour, inchangé", "rewritten": "réécrit"}
+    print(f"[VERIFIED] settings HERBERT {labels[result.status]} pour {project.name}: {result.path}")
+    print(f"  sha256={result.sha256}")
+    if result.status == "rewritten":
+        print(f"  (ancien sha256={result.previous_sha256})")
+    print('  Chargé par `engine task run-headless` via --settings <ce fichier> --setting-sources "" ;')
+    print("  rien n'est écrit dans le dépôt du projet cible.")
     return 0
 
 
@@ -771,6 +811,11 @@ def cmd_task_run_headless(args: argparse.Namespace) -> int:
     # Import différé : app/headless_orchestrator.py importe cmd_task_test et
     # _regenerate_dashboard depuis ce module — un import en tête de fichier
     # créerait une dépendance circulaire au chargement.
+    from app.claude_headless import (
+        ClaudeExecutableConfigError,
+        InvocationInfrastructureError,
+        validate_claude_executable,
+    )
     from app.headless_orchestrator import HeadlessOrchestrationError, run_headless_task
 
     config = load_config(_config_path())
@@ -779,6 +824,16 @@ def cmd_task_run_headless(args: argparse.Namespace) -> int:
     max_iterations = int(headless_config.get("max_iterations", 3))
     timeout_seconds = int(headless_config.get("timeout_seconds", 600))
 
+    # Fatal AU DÉMARRAGE, avant d'ouvrir la base ou de toucher la tâche :
+    # une configuration d'exécutable invalide n'est jamais une erreur "par
+    # tâche" (aucune transition, aucune itération).
+    try:
+        claude_exe = validate_claude_executable(headless_config.get("executable"))
+    except ClaudeExecutableConfigError as exc:
+        print(f"[FAILED] configuration HERBERT invalide (fatal, aucune tâche touchée) : {exc}")
+        return 2
+    print(f"[VERIFIED] exécutable claude : {claude_exe.path} — `--version` : {claude_exe.version}")
+
     conn = _connect()
     try:
         task = run_headless_task(
@@ -786,11 +841,17 @@ def cmd_task_run_headless(args: argparse.Namespace) -> int:
             args.task_id,
             _logs_dir(),
             model=model,
+            executable=claude_exe.path,
+            herbert_root=REPO_ROOT,
             max_iterations=max_iterations,
             timeout_seconds=timeout_seconds,
         )
     except HeadlessOrchestrationError as exc:
         print(f"[FAILED] {exc}")
+        return 1
+    except InvocationInfrastructureError as exc:
+        print(f"[BLOCKED] panne d'invocation (infrastructure, pas un échec de tâche) : {exc}")
+        print("  Tâche passée en BLOCKED, aucune itération consommée, pytest non lancé.")
         return 1
     finally:
         conn.close()
@@ -1249,6 +1310,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--security", action="store_true", default=False, help="inclut la vérification de sécurité des hooks"
     )
     doctor_parser.set_defaults(func=cmd_doctor)
+
+    init_hooks_parser = subparsers.add_parser(
+        "init-hooks",
+        help="génère le fichier settings HERBERT (hooks) d'un projet enregistré, sous data/ — jamais dans le projet",
+    )
+    init_hooks_parser.add_argument("path", help="chemin du projet cible (tel qu'enregistré via project add)")
+    init_hooks_parser.set_defaults(func=cmd_init_hooks)
 
     project_parser = subparsers.add_parser("project", help="gestion des projets")
     project_sub = project_parser.add_subparsers(dest="project_command", required=True)
