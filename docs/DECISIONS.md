@@ -484,3 +484,54 @@ pas de `cli.js`).
   `--help` du CLI 2.1.235 ne documente pas le cas de la liste vide.
 - **Ordre des arguments** : seul l'ordre utilisé (prompt juste après
   `-p`, options ensuite) a été testé en réel.
+
+## Incident — Suppression de `master` le 22/08/2026 — enquête close (2026-09-24)
+
+**Verdict : consolidation manuelle des deux branches, aucune perte de
+travail, aucune action corrective nécessaire. Incident clos.**
+
+### Faits (journal d'activité GitHub, `gh api repos/LP-D/HERBERT/activity`)
+
+- 2026-08-22 14:20:19 UTC : le compte GitHub `LP-D` (type `User`, ni app
+  ni bot) force-pushe `main` avec le contenu de `master`
+  (`47ebe4f` -> `08bff24`).
+- 2026-08-22 14:20:22 UTC, trois secondes plus tard : le même compte
+  supprime `master` (`08bff24` -> `0000000`).
+- Action confirmée par Léon-Paul comme une consolidation manuelle des deux
+  branches, faite par lui-même.
+
+### Vérifications menées (lecture seule, `gh api` : activity, events, commits, pulls, hooks)
+
+- Aucune trace de webhook, de GitHub Action (0 workflow, 0 exécution), de
+  PR (0 au total, `delete_branch_on_merge: false`), de déploiement ou de
+  clé de déploiement. Les installations d'applications GitHub ne sont pas
+  lisibles avec un jeton utilisateur (HTTP 401/403), mais les deux actions
+  sont attribuées à un compte de type `User`.
+- Le seul commit devenu orphelin, `47ebe4f`, est le README auto-généré par
+  GitHub à la création du dépôt (2026-08-20 12:27:33 UTC, committer
+  `GitHub <noreply@github.com>`, aucun parent, un fichier d'une ligne :
+  `# HERBERT`). Il ne partage aucun ancêtre avec l'historique actuel
+  (`git merge-base --is-ancestor 47ebe4f 08bff24` -> 1), mais ne contenait
+  aucun travail : `README.md` a été recréé indépendamment par `aced6ab`
+  (2026-08-21). Aucune perte réelle.
+- Le dépôt local `herbert/` n'est pas l'origine de ces actions : son
+  reflog ne montre aucun push vers `main` avant le 2026-09-24, et aucun
+  événement de hook HERBERT n'est journalisé après 13:53:20 UTC le 22/08.
+
+### Lien avec l'écart `master` / `origin/main` constaté le 2026-09-23
+
+L'écart constaté ce jour-là (`master` local = `origin/master` = `08bff24`,
+14 commits de retard sur `origin/main`, aucun commit propre) en est la
+conséquence directe : la branche distante `master` n'existait plus depuis
+le 22/08, mais la référence locale `origin/master` restait en cache
+(`git fetch` sans `--prune` ne retire pas une branche supprimée côté
+distant). Découvert le 2026-09-24 : le push de `master` a répondu
+`* [new branch]`.
+
+### Résolution
+
+- `master` recréé le 2026-09-24 (08:02:32 UTC) par un fast-forward strict
+  depuis `origin/main` (`ca7269c`) ; `main` et `master` identiques et
+  synchronisés (vérifié par `git ls-remote`).
+- Aucune action corrective nécessaire côté sécurité du dépôt ou du compte
+  GitHub.
